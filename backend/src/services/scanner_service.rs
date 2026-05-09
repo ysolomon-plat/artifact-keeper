@@ -17,7 +17,7 @@ use bytes::Bytes;
 use reqwest::Client;
 use serde::Deserialize;
 use sqlx::PgPool;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -612,36 +612,92 @@ pub(crate) async fn capture_cli_version_with_timeout(
     }
 }
 
-/// TTL applied to a successful version probe. Versions only change when the
-/// scanner binary is upgraded, which on long-lived backend pods only happens
-/// at deploy/restart time, so a long hit TTL is safe and cheap.
-pub(crate) const VERSION_CACHE_HIT_TTL: Duration = Duration::from_secs(3600);
+/// Default TTL (in seconds) applied to a successful version probe. Versions
+/// only change when the scanner binary is upgraded, which on long-lived
+/// backend pods only happens at deploy/restart time, so a long hit TTL is
+/// safe and cheap. Override at process start with the
+/// `AK_SCANNER_VERSION_HIT_TTL_SECS` environment variable.
+pub(crate) const VERSION_CACHE_DEFAULT_HIT_TTL_SECS: u64 = 3600;
 
-/// TTL applied to a failed version probe. A short miss TTL ensures that a
-/// transient probe failure (binary missing on PATH, init container still
-/// pulling, scanner pod momentarily unreachable) is retried promptly so that
-/// the `scan_results.scanner_version` column starts populating as soon as
-/// the operator fixes the underlying issue, without requiring a pod restart.
-pub(crate) const VERSION_CACHE_MISS_TTL: Duration = Duration::from_secs(60);
+/// Default TTL (in seconds) applied to a failed version probe. A short miss
+/// TTL ensures that a transient probe failure (binary missing on PATH, init
+/// container still pulling, scanner pod momentarily unreachable) is retried
+/// promptly so that the `scan_results.scanner_version` column starts
+/// populating as soon as the operator fixes the underlying issue, without
+/// requiring a pod restart. Override at process start with the
+/// `AK_SCANNER_VERSION_MISS_TTL_SECS` environment variable.
+pub(crate) const VERSION_CACHE_DEFAULT_MISS_TTL_SECS: u64 = 60;
+
+/// Constant aliases preserved for tests that need to assert against the
+/// compile-time defaults independently of any env override that might be
+/// set in the surrounding process.
+#[cfg(test)]
+pub(crate) const VERSION_CACHE_HIT_TTL: Duration =
+    Duration::from_secs(VERSION_CACHE_DEFAULT_HIT_TTL_SECS);
+#[cfg(test)]
+pub(crate) const VERSION_CACHE_MISS_TTL: Duration =
+    Duration::from_secs(VERSION_CACHE_DEFAULT_MISS_TTL_SECS);
+
+/// Environment variable name controlling [`VersionCache`] hit TTL (seconds).
+pub(crate) const VERSION_CACHE_HIT_TTL_ENV: &str = "AK_SCANNER_VERSION_HIT_TTL_SECS";
+/// Environment variable name controlling [`VersionCache`] miss TTL (seconds).
+pub(crate) const VERSION_CACHE_MISS_TTL_ENV: &str = "AK_SCANNER_VERSION_MISS_TTL_SECS";
+
+/// Read a `Duration` (in whole seconds) from `var`, falling back to
+/// `default_secs` when the variable is unset, unparseable, or zero.
+/// Operators get a single, well-known knob per TTL without YAML reload
+/// machinery; misconfigured values silently fall back rather than panicking
+/// at startup.
+fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
 
 /// Time-bounded cache for a scanner's CLI version string.
 ///
 /// Replaces the previous `tokio::sync::OnceCell<Option<String>>` cache, which
 /// pinned a `None` result for the entire process lifetime once the first
-/// probe failed. With `VersionCache`, `Some(_)` values are cached for
-/// [`VERSION_CACHE_HIT_TTL`] and `None` values for the much shorter
-/// [`VERSION_CACHE_MISS_TTL`], so transient probe failures are retried.
-#[derive(Debug, Default)]
+/// probe failed. With `VersionCache`, `Some(_)` values are cached for the
+/// configured hit TTL and `None` values for the much shorter miss TTL, so
+/// transient probe failures are retried.
+///
+/// Concurrent miss-path callers are de-duplicated by `probe_lock`: only one
+/// caller probes per cache miss, the rest wait on the lock and observe the
+/// just-written cache entry without re-probing. This addresses the
+/// thundering-herd risk flagged in the #1012 review.
+#[derive(Debug)]
 pub(crate) struct VersionCache {
     inner: RwLock<Option<(Instant, Option<String>)>>,
+    /// Single-flight gate: serializes concurrent probes so a fan-out of
+    /// scan workers all hitting an empty cache results in exactly one
+    /// `Command` invocation rather than N parallel invocations.
+    probe_lock: Mutex<()>,
+    hit_ttl: Duration,
+    miss_ttl: Duration,
 }
 
 impl VersionCache {
     /// Create an empty cache. The first call to [`cached_cli_version`] will
-    /// run the probe.
+    /// run the probe. TTLs are sourced from the environment at construction
+    /// time (see [`VERSION_CACHE_HIT_TTL_ENV`] /
+    /// [`VERSION_CACHE_MISS_TTL_ENV`]), with the compile-time defaults as
+    /// fallback. Reading once at construction time keeps the hot path env-free.
     pub(crate) fn new() -> Self {
         Self {
             inner: RwLock::new(None),
+            probe_lock: Mutex::new(()),
+            hit_ttl: env_duration_secs(
+                VERSION_CACHE_HIT_TTL_ENV,
+                VERSION_CACHE_DEFAULT_HIT_TTL_SECS,
+            ),
+            miss_ttl: env_duration_secs(
+                VERSION_CACHE_MISS_TTL_ENV,
+                VERSION_CACHE_DEFAULT_MISS_TTL_SECS,
+            ),
         }
     }
 
@@ -663,6 +719,12 @@ impl VersionCache {
     }
 }
 
+impl Default for VersionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Resolve a scanner's lazily-cached version string, probing via `probe`
 /// when the cache is empty or the previous entry has expired.
 ///
@@ -672,10 +734,14 @@ impl VersionCache {
 /// `image_scanner`, `incus_scanner`, `grype_scanner`, and `openscap_scanner`.
 ///
 /// TTL semantics:
-/// * `Some(version)` is cached for [`VERSION_CACHE_HIT_TTL`].
-/// * `None` is cached for [`VERSION_CACHE_MISS_TTL`] so transient probe
+/// * `Some(version)` is cached for the configured hit TTL.
+/// * `None` is cached for the configured miss TTL so transient probe
 ///   failures (binary not yet on PATH, scanner pod restarting) are retried
 ///   without waiting for a backend pod restart.
+///
+/// Concurrency: the miss path is single-flighted via `cell.probe_lock` so
+/// concurrent callers on a cold cache produce exactly one probe and the
+/// remaining callers observe the just-written entry on re-check.
 pub(crate) async fn cached_cli_version<F, Fut>(cell: &VersionCache, probe: F) -> Option<String>
 where
     F: FnOnce() -> Fut,
@@ -686,9 +752,9 @@ where
         let guard = cell.inner.read().await;
         if let Some((stored_at, ref value)) = *guard {
             let ttl = if value.is_some() {
-                VERSION_CACHE_HIT_TTL
+                cell.hit_ttl
             } else {
-                VERSION_CACHE_MISS_TTL
+                cell.miss_ttl
             };
             if stored_at.elapsed() < ttl {
                 return value.clone();
@@ -696,25 +762,35 @@ where
         }
     }
 
-    // Slow path: probe outside any lock, then take a write lock.
-    // We accept that two concurrent callers may both race a probe on cache
-    // miss; that is harmless and strictly better than holding a write lock
-    // across an external `Command` invocation that may take seconds.
-    let probed = probe().await;
-    let mut guard = cell.inner.write().await;
-    // Re-check: another writer may have refreshed the cell while we were
-    // probing. Prefer the still-fresh existing entry over our just-probed
-    // value to keep the TTL window stable.
-    if let Some((stored_at, ref value)) = *guard {
-        let ttl = if value.is_some() {
-            VERSION_CACHE_HIT_TTL
-        } else {
-            VERSION_CACHE_MISS_TTL
-        };
-        if stored_at.elapsed() < ttl {
-            return value.clone();
+    // Slow path: serialize concurrent probes via probe_lock so a thundering
+    // herd of cold-cache callers produces one probe, not N. The lock spans
+    // both the probe and the cache write so a second waiter that wakes up
+    // with the lock will see the just-written entry on re-check.
+    let _probe_guard = cell.probe_lock.lock().await;
+
+    // Re-check under probe_lock: a previous holder may have just refreshed
+    // the cell. Re-using its result avoids a redundant probe and keeps the
+    // TTL window stable.
+    {
+        let guard = cell.inner.read().await;
+        if let Some((stored_at, ref value)) = *guard {
+            let ttl = if value.is_some() {
+                cell.hit_ttl
+            } else {
+                cell.miss_ttl
+            };
+            if stored_at.elapsed() < ttl {
+                return value.clone();
+            }
         }
     }
+
+    // Probe with probe_lock held but `inner` unlocked, so other readers on
+    // the fast path can still observe stale-but-positive entries during the
+    // refresh window if any exist (they don't, on a cold cache, but this
+    // matters when an old `Some` is being refreshed).
+    let probed = probe().await;
+    let mut guard = cell.inner.write().await;
     *guard = Some((Instant::now(), probed.clone()));
     probed
 }
@@ -2617,20 +2693,16 @@ mod tests {
     }
 
     /// TTL constants are sane: hits last much longer than misses, and the
-    /// Round 1 review feedback (#1012 R1): exercise the concurrent-miss
-    /// path where two callers simultaneously see an empty cache, both
-    /// drop the read lock, both probe, then race for the write lock.
-    /// The double-checked re-check under the write lock is supposed to
-    /// prevent the second caller from overwriting the first's still-fresh
-    /// entry. Without this test the re-check branch is unexercised.
+    /// Round 1 review feedback (#1012 R1): the miss path is single-flighted
+    /// via `probe_lock`. Two concurrent callers on an empty cache must
+    /// produce exactly ONE probe; the second caller waits on `probe_lock`
+    /// and observes the first caller's just-written entry on re-check.
     ///
-    /// Acceptable outcomes:
-    /// - Probe counter is in [1, 2] (deliberate non-single-flight; both
-    ///   callers may probe before either finishes).
-    /// - Both callers return the SAME value (the winner of the write-lock
-    ///   race; the loser discards its `probed` and reads the winner's).
+    /// This is the test that proves the thundering-herd mitigation works.
+    /// If the single-flight regresses, this test catches it because the
+    /// probe counter would tick twice instead of once.
     #[tokio::test]
-    async fn test_version_cache_concurrent_miss_returns_consistent_value() {
+    async fn test_version_cache_concurrent_miss_single_flights_probe() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
 
@@ -2638,14 +2710,14 @@ mod tests {
         let probe_count = Arc::new(AtomicUsize::new(0));
 
         // The probe sleeps briefly so both callers reliably overlap on
-        // the slow path. The returned value is fixed so a passing test
-        // means both callers ended up with the same cache entry.
+        // the slow path. With single-flight, only the first caller runs
+        // the probe; the second waits on probe_lock and re-checks.
         let make_probe = |pc: Arc<AtomicUsize>| {
             move || {
                 let pc = pc.clone();
                 async move {
                     pc.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                     Some("trivy-0.62.1".to_string())
                 }
             }
@@ -2666,21 +2738,130 @@ mod tests {
             Some("trivy-0.62.1".to_string()),
             "first caller must return the probed value"
         );
-        assert_eq!(
-            a, b,
-            "concurrent callers MUST observe the same cache entry; \
-             the write-lock re-check ensures whoever loses the write \
-             race reads the winner's value rather than its own probe"
-        );
+        assert_eq!(a, b, "concurrent callers MUST observe the same cache entry");
 
         let probes = probe_count.load(Ordering::SeqCst);
-        assert!(
-            (1..=2).contains(&probes),
-            "expected 1 or 2 probes (deliberate non-single-flight on miss); \
-             observed {}. >2 means the re-check is broken or the cache lost \
-             the just-written entry.",
+        assert_eq!(
+            probes, 1,
+            "single-flight: exactly one probe must run for N concurrent \
+             cold-cache callers; observed {}",
             probes
         );
+    }
+
+    /// Single-flight stress: a fan-out of 16 concurrent callers on an
+    /// empty cache must still produce exactly ONE probe. Catches any
+    /// regression where probe_lock is dropped or re-check skipped.
+    #[tokio::test]
+    async fn test_version_cache_single_flight_under_fanout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let cell = Arc::new(VersionCache::default());
+        let probe_count = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let c = cell.clone();
+            let pc = probe_count.clone();
+            handles.push(tokio::spawn(async move {
+                cached_cli_version(&c, || {
+                    let pc = pc.clone();
+                    async move {
+                        pc.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        Some("grype-0.83.0".to_string())
+                    }
+                })
+                .await
+            }));
+        }
+
+        let mut results = Vec::with_capacity(16);
+        for h in handles {
+            results.push(h.await.expect("join"));
+        }
+
+        for r in &results {
+            assert_eq!(r.as_deref(), Some("grype-0.83.0"));
+        }
+        assert_eq!(
+            probe_count.load(Ordering::SeqCst),
+            1,
+            "16 concurrent cold-cache callers must produce exactly 1 probe"
+        );
+    }
+
+    /// Env override (#1012 R1, code-quality): TTLs default to the compile-
+    /// time constants when env vars are unset, are honoured when set, and
+    /// silently fall back to defaults when malformed (so a typo in a
+    /// container manifest doesn't crash the backend at startup).
+    #[test]
+    fn test_env_duration_secs_parses_overrides_and_falls_back() {
+        // Use unique var names per assertion so this test does not race
+        // with other tests in the same process even though Rust unit
+        // tests share a process. SAFETY: these vars are local to this
+        // test and never read elsewhere.
+        let unset_var = "AK_TEST_VERSION_CACHE_TTL_UNSET_X1";
+        let set_var = "AK_TEST_VERSION_CACHE_TTL_SET_X1";
+        let bad_var = "AK_TEST_VERSION_CACHE_TTL_BAD_X1";
+        let zero_var = "AK_TEST_VERSION_CACHE_TTL_ZERO_X1";
+
+        std::env::remove_var(unset_var);
+        std::env::set_var(set_var, "120");
+        std::env::set_var(bad_var, "not-a-number");
+        std::env::set_var(zero_var, "0");
+
+        assert_eq!(
+            env_duration_secs(unset_var, 60),
+            Duration::from_secs(60),
+            "unset var must fall back to default"
+        );
+        assert_eq!(
+            env_duration_secs(set_var, 60),
+            Duration::from_secs(120),
+            "set var must override default"
+        );
+        assert_eq!(
+            env_duration_secs(bad_var, 60),
+            Duration::from_secs(60),
+            "unparseable var must fall back to default (no panic)"
+        );
+        assert_eq!(
+            env_duration_secs(zero_var, 60),
+            Duration::from_secs(60),
+            "zero must be rejected as a misconfiguration; fall back to default"
+        );
+
+        std::env::remove_var(set_var);
+        std::env::remove_var(bad_var);
+        std::env::remove_var(zero_var);
+    }
+
+    /// VersionCache picks up TTLs from the environment at construction.
+    /// Default-constructed cache (no env) gets the compile-time defaults.
+    #[test]
+    fn test_version_cache_reads_ttl_env_at_construction() {
+        // Defaults when env is unset.
+        std::env::remove_var(VERSION_CACHE_HIT_TTL_ENV);
+        std::env::remove_var(VERSION_CACHE_MISS_TTL_ENV);
+        let default_cache = VersionCache::new();
+        assert_eq!(default_cache.hit_ttl, VERSION_CACHE_HIT_TTL);
+        assert_eq!(default_cache.miss_ttl, VERSION_CACHE_MISS_TTL);
+
+        // Overridden values are picked up at construction.
+        std::env::set_var(VERSION_CACHE_HIT_TTL_ENV, "7200");
+        std::env::set_var(VERSION_CACHE_MISS_TTL_ENV, "30");
+        let tuned_cache = VersionCache::new();
+        assert_eq!(tuned_cache.hit_ttl, Duration::from_secs(7200));
+        assert_eq!(tuned_cache.miss_ttl, Duration::from_secs(30));
+
+        // The default-constructed cache above must not have observed the
+        // later env mutation; TTLs are sampled at `new()` time only.
+        assert_eq!(default_cache.hit_ttl, VERSION_CACHE_HIT_TTL);
+
+        std::env::remove_var(VERSION_CACHE_HIT_TTL_ENV);
+        std::env::remove_var(VERSION_CACHE_MISS_TTL_ENV);
     }
 
     /// miss TTL is long enough to dampen probe storms but short enough that
