@@ -127,17 +127,7 @@ async fn package_info(
             // Pass 1+2: any member that already has artifact rows for this name.
             // Non-Remote members run first so they shadow Remote upstreams; this
             // matches the supply-chain-attack guard documented on PR #974.
-            let mut ordered_members: Vec<&Repository> = Vec::with_capacity(members.len());
-            ordered_members.extend(
-                members
-                    .iter()
-                    .filter(|m| m.repo_type != RepositoryType::Remote),
-            );
-            ordered_members.extend(
-                members
-                    .iter()
-                    .filter(|m| m.repo_type == RepositoryType::Remote),
-            );
+            let ordered_members = order_members_local_first(&members);
 
             for member in ordered_members {
                 if let Some(resp) =
@@ -550,6 +540,28 @@ async fn list_versions(
 // Virtual repo merging helpers
 // ---------------------------------------------------------------------------
 
+/// Order virtual repo members so non-Remote members come before Remote
+/// members, preserving the original priority ordering within each group.
+///
+/// Pure function so the supply-chain-shadowing rule from PR #974 can be
+/// unit-tested without standing up a real virtual-repo configuration.
+/// Non-Remote-first ordering prevents an upstream from shadowing a
+/// locally-published package name (#973).
+fn order_members_local_first(members: &[Repository]) -> Vec<&Repository> {
+    let mut ordered: Vec<&Repository> = Vec::with_capacity(members.len());
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type != RepositoryType::Remote),
+    );
+    ordered.extend(
+        members
+            .iter()
+            .filter(|m| m.repo_type == RepositoryType::Remote),
+    );
+    ordered
+}
+
 /// Build a `/hex/<repo>/packages/<name>` JSON response from artifact rows
 /// in a single member repo. Returns `Ok(None)` if the member has no
 /// artifacts for `name`, so the caller can advance to the next member.
@@ -590,21 +602,12 @@ async fn fetch_package_info_from_member(
         .filter_map(|r| r.try_get::<uuid::Uuid, _>("id").ok())
         .collect();
 
-    let releases: Vec<serde_json::Value> = rows
+    let release_rows: Vec<(Option<String>, String)> = rows
         .iter()
         .map(|r| {
             let version: Option<String> = r.try_get("version").ok();
-            let version = version.unwrap_or_default();
             let checksum: String = r.try_get("checksum_sha256").unwrap_or_default();
-            let tarball_url = format!(
-                "/hex/{}/tarballs/{}-{}.tar",
-                virtual_repo_key, name, version
-            );
-            serde_json::json!({
-                "version": version,
-                "url": tarball_url,
-                "checksum": checksum,
-            })
+            (version, checksum)
         })
         .collect();
 
@@ -617,11 +620,7 @@ async fn fetch_package_info_from_member(
     .unwrap_or(Some(0))
     .unwrap_or(0);
 
-    let json = serde_json::json!({
-        "name": name,
-        "releases": releases,
-        "downloads": download_count,
-    });
+    let json = build_package_info_json(virtual_repo_key, name, &release_rows, download_count);
 
     Ok(Some(
         Response::builder()
@@ -630,6 +629,36 @@ async fn fetch_package_info_from_member(
             .body(Body::from(serde_json::to_string(&json).unwrap()))
             .unwrap(),
     ))
+}
+
+/// Build the `/hex/<repo>/packages/<name>` JSON payload from a list of
+/// (version, checksum) pairs and a precomputed download count.
+///
+/// Pure transformation factored out so the tarball URL formatting and
+/// release-array shape can be unit-tested without a database.
+fn build_package_info_json(
+    virtual_repo_key: &str,
+    name: &str,
+    release_rows: &[(Option<String>, String)],
+    download_count: i64,
+) -> serde_json::Value {
+    let releases: Vec<serde_json::Value> = release_rows
+        .iter()
+        .map(|(version, checksum)| {
+            let v = version.clone().unwrap_or_default();
+            let tarball_url = format!("/hex/{}/tarballs/{}-{}.tar", virtual_repo_key, name, v);
+            serde_json::json!({
+                "version": v,
+                "url": tarball_url,
+                "checksum": checksum,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "name": name,
+        "releases": releases,
+        "downloads": download_count,
+    })
 }
 
 /// Query distinct package names from every virtual member's artifacts table.
@@ -867,6 +896,140 @@ fn extract_erlang_term_value(content: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // order_members_local_first (#973 supply-chain-shadowing rule)
+    // -----------------------------------------------------------------------
+
+    fn make_member(repo_type: RepositoryType, key: &str) -> Repository {
+        use crate::models::repository::{ReplicationPriority, RepositoryFormat};
+        Repository {
+            id: uuid::Uuid::new_v4(),
+            key: key.to_string(),
+            name: key.to_string(),
+            description: None,
+            format: RepositoryFormat::Hex,
+            repo_type,
+            storage_backend: "filesystem".to_string(),
+            storage_path: String::new(),
+            upstream_url: None,
+            is_public: false,
+            quota_bytes: None,
+            replication_priority: ReplicationPriority::OnDemand,
+            promotion_target_id: None,
+            promotion_policy_id: None,
+            curation_enabled: false,
+            curation_source_repo_id: None,
+            curation_target_repo_id: None,
+            curation_default_action: "allow".to_string(),
+            curation_sync_interval_secs: 0,
+            curation_auto_fetch: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_order_members_local_first_puts_local_before_remote() {
+        let m1 = make_member(RepositoryType::Remote, "remote-1");
+        let m2 = make_member(RepositoryType::Local, "local-1");
+        let m3 = make_member(RepositoryType::Remote, "remote-2");
+        let members = vec![m1, m2, m3];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "local-1");
+        assert_eq!(ordered[1].key, "remote-1");
+        assert_eq!(ordered[2].key, "remote-2");
+    }
+
+    #[test]
+    fn test_order_members_local_first_preserves_priority_within_group() {
+        // Multiple non-Remote members keep their original relative order;
+        // same for Remote members.
+        let m1 = make_member(RepositoryType::Staging, "stage");
+        let m2 = make_member(RepositoryType::Remote, "remote-high");
+        let m3 = make_member(RepositoryType::Local, "local");
+        let m4 = make_member(RepositoryType::Remote, "remote-low");
+        let members = vec![m1, m2, m3, m4];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered[0].key, "stage");
+        assert_eq!(ordered[1].key, "local");
+        assert_eq!(ordered[2].key, "remote-high");
+        assert_eq!(ordered[3].key, "remote-low");
+    }
+
+    #[test]
+    fn test_order_members_local_first_empty_input() {
+        let members: Vec<Repository> = Vec::new();
+        let ordered = order_members_local_first(&members);
+        assert!(ordered.is_empty());
+    }
+
+    #[test]
+    fn test_order_members_local_first_all_remote() {
+        let members = vec![
+            make_member(RepositoryType::Remote, "r1"),
+            make_member(RepositoryType::Remote, "r2"),
+        ];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].key, "r1");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_package_info_json (#973)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_package_info_json_emits_virtual_key_tarball_urls() {
+        // The tarball URL must reference the virtual repo's key, not the
+        // member repo's key, so subsequent `mix deps.get` fetches stay
+        // routed through the same virtual endpoint.
+        let release_rows = vec![
+            (Some("1.7.0".to_string()), "sha-1".to_string()),
+            (Some("1.7.1".to_string()), "sha-2".to_string()),
+        ];
+        let json = build_package_info_json("hex-virtual", "phoenix", &release_rows, 42);
+        assert_eq!(json["name"].as_str(), Some("phoenix"));
+        assert_eq!(json["downloads"].as_i64(), Some(42));
+        let releases = json["releases"].as_array().unwrap();
+        assert_eq!(releases.len(), 2);
+        assert_eq!(
+            releases[0]["url"].as_str(),
+            Some("/hex/hex-virtual/tarballs/phoenix-1.7.0.tar")
+        );
+        assert_eq!(releases[0]["checksum"].as_str(), Some("sha-1"));
+        assert_eq!(releases[1]["version"].as_str(), Some("1.7.1"));
+    }
+
+    #[test]
+    fn test_build_package_info_json_handles_empty_releases() {
+        let json = build_package_info_json("v", "lonely", &[], 0);
+        assert_eq!(json["releases"].as_array().unwrap().len(), 0);
+        assert_eq!(json["downloads"].as_i64(), Some(0));
+    }
+
+    #[test]
+    fn test_build_package_info_json_missing_version_becomes_empty_string() {
+        // Defensive against rows where `a.version IS NULL` (shouldn't
+        // happen for Hex but the DB doesn't constrain it).
+        let release_rows = vec![(None, "sha".to_string())];
+        let json = build_package_info_json("v", "p", &release_rows, 0);
+        let r = &json["releases"][0];
+        assert_eq!(r["version"].as_str(), Some(""));
+        assert_eq!(r["url"].as_str(), Some("/hex/v/tarballs/p-.tar"));
+    }
+
+    #[test]
+    fn test_order_members_local_first_all_local() {
+        let members = vec![
+            make_member(RepositoryType::Local, "l1"),
+            make_member(RepositoryType::Staging, "s1"),
+        ];
+        let ordered = order_members_local_first(&members);
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].key, "l1");
+        assert_eq!(ordered[1].key, "s1");
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions (moved into test module)

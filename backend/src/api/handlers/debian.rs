@@ -612,13 +612,21 @@ async fn try_virtual_dists_detecting_change(
 }
 
 fn map_proxy_err(e: crate::error::AppError) -> Response {
+    let (status, msg) = proxy_err_status_and_message(&e);
+    (status, msg).into_response()
+}
+
+/// Pure helper that decides the HTTP status and message for an
+/// `AppError` returned from `ProxyService::fetch_dists_detecting_change`.
+/// Factored out of [`map_proxy_err`] so the mapping table can be unit
+/// tested without constructing an `axum::Response`.
+fn proxy_err_status_and_message(e: &crate::error::AppError) -> (StatusCode, String) {
     match e {
-        crate::error::AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+        crate::error::AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
         other => (
             StatusCode::BAD_GATEWAY,
             format!("Upstream fetch failed: {}", other),
-        )
-            .into_response(),
+        ),
     }
 }
 
@@ -1498,6 +1506,40 @@ async fn upload_raw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // proxy_err_status_and_message (#1147)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_proxy_err_status_not_found_maps_to_404() {
+        let err = crate::error::AppError::NotFound("missing".to_string());
+        let (status, msg) = proxy_err_status_and_message(&err);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(msg, "missing");
+    }
+
+    #[test]
+    fn test_proxy_err_status_storage_maps_to_502() {
+        let err = crate::error::AppError::Storage("io error".to_string());
+        let (status, msg) = proxy_err_status_and_message(&err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(msg.starts_with("Upstream fetch failed"));
+    }
+
+    #[test]
+    fn test_proxy_err_status_validation_maps_to_502() {
+        let err = crate::error::AppError::Validation("invalid path".to_string());
+        let (status, _msg) = proxy_err_status_and_message(&err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn test_proxy_err_status_internal_maps_to_502() {
+        let err = crate::error::AppError::Internal("boom".to_string());
+        let (status, _msg) = proxy_err_status_and_message(&err);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
 
     // -----------------------------------------------------------------------
     // Router construction

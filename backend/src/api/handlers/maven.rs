@@ -1435,24 +1435,20 @@ async fn update_artifact_record(
     Ok(())
 }
 
-/// Append a freshly-uploaded secondary file to an existing artifact's
-/// `metadata.files` array and merge POM-parsed fields when the upload is
-/// a POM. Used by both the SNAPSHOT primary re-upload path and the
-/// secondary-file path so the two arms share a single source of truth
-/// for grouped file metadata (#1092).
+/// Build the updated `metadata` JSON value for a secondary-file upload.
 ///
-/// `existing_meta` is the metadata JSON loaded for `existing_id` before
-/// the upload, or `None` if no metadata row existed yet. On return the
-/// metadata row reflects the appended file and any merged POM fields.
-async fn append_secondary_file_to_metadata(
-    db: &sqlx::PgPool,
-    existing_id: uuid::Uuid,
+/// Pure transformation factored out of
+/// [`append_secondary_file_to_metadata`] so the JSON-merge rules
+/// (dedupe-by-path, POM field merge) can be unit-tested without a
+/// database. Returns the JSON value that should be persisted to
+/// `artifact_metadata.metadata` for `existing_id` (#1092).
+fn build_updated_secondary_metadata(
     existing_meta: Option<serde_json::Value>,
     coords: &MavenCoordinates,
     path: &str,
     new_file: serde_json::Value,
     file_metadata: &serde_json::Value,
-) {
+) -> serde_json::Value {
     let mut updated_meta = existing_meta.unwrap_or_else(|| {
         serde_json::json!({
             "groupId": coords.group_id,
@@ -1487,6 +1483,30 @@ async fn append_secondary_file_to_metadata(
             }
         }
     }
+
+    updated_meta
+}
+
+/// Append a freshly-uploaded secondary file to an existing artifact's
+/// `metadata.files` array and merge POM-parsed fields when the upload is
+/// a POM. Used by both the SNAPSHOT primary re-upload path and the
+/// secondary-file path so the two arms share a single source of truth
+/// for grouped file metadata (#1092).
+///
+/// `existing_meta` is the metadata JSON loaded for `existing_id` before
+/// the upload, or `None` if no metadata row existed yet. On return the
+/// metadata row reflects the appended file and any merged POM fields.
+async fn append_secondary_file_to_metadata(
+    db: &sqlx::PgPool,
+    existing_id: uuid::Uuid,
+    existing_meta: Option<serde_json::Value>,
+    coords: &MavenCoordinates,
+    path: &str,
+    new_file: serde_json::Value,
+    file_metadata: &serde_json::Value,
+) {
+    let updated_meta =
+        build_updated_secondary_metadata(existing_meta, coords, path, new_file, file_metadata);
 
     let _ = sqlx::query(
         r#"
@@ -1861,6 +1881,160 @@ async fn upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // build_updated_secondary_metadata (#1092)
+    // -----------------------------------------------------------------------
+
+    fn sample_coords() -> MavenCoordinates {
+        MavenCoordinates {
+            group_id: "com.example".to_string(),
+            artifact_id: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            extension: "pom".to_string(),
+            classifier: None,
+        }
+    }
+
+    fn make_file_json(path: &str, ext: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": path,
+            "extension": ext,
+            "storageKey": format!("maven/{}", path),
+            "sizeBytes": 100,
+            "sha256": "abc",
+        })
+    }
+
+    #[test]
+    fn test_build_updated_secondary_metadata_initial_pom_after_jar() {
+        // Existing metadata: a JAR primary, empty files array.
+        let existing = Some(serde_json::json!({
+            "groupId": "com.example",
+            "artifactId": "demo",
+            "version": "1.0.0",
+            "files": [],
+        }));
+        let coords = sample_coords();
+        let new_file = make_file_json("com/example/demo/1.0.0/demo-1.0.0.pom", "pom");
+        let file_meta = serde_json::json!({
+            "name": "Demo Library",
+            "description": "Example POM",
+            "url": "https://example.com",
+            "dependencies": [],
+        });
+        let updated = build_updated_secondary_metadata(
+            existing,
+            &coords,
+            "demo-1.0.0.pom",
+            new_file,
+            &file_meta,
+        );
+
+        // POM is appended to files.
+        let files = updated["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["extension"].as_str(), Some("pom"));
+        // POM-parsed fields are merged in.
+        assert_eq!(updated["name"].as_str(), Some("Demo Library"));
+        assert_eq!(updated["description"].as_str(), Some("Example POM"));
+    }
+
+    #[test]
+    fn test_build_updated_secondary_metadata_pom_does_not_clobber_existing_fields() {
+        // Existing metadata already has a `name`. POM upload's `name`
+        // must not overwrite it.
+        let existing = Some(serde_json::json!({
+            "groupId": "com.example",
+            "artifactId": "demo",
+            "version": "1.0.0",
+            "name": "Manually Set Name",
+            "files": [],
+        }));
+        let coords = sample_coords();
+        let new_file = make_file_json("com/example/demo/1.0.0/demo-1.0.0.pom", "pom");
+        let file_meta = serde_json::json!({"name": "POM Name"});
+        let updated = build_updated_secondary_metadata(
+            existing,
+            &coords,
+            "demo-1.0.0.pom",
+            new_file,
+            &file_meta,
+        );
+        assert_eq!(updated["name"].as_str(), Some("Manually Set Name"));
+    }
+
+    #[test]
+    fn test_build_updated_secondary_metadata_dedupes_by_path() {
+        // Re-upload of the same SNAPSHOT classifier replaces its prior
+        // entry rather than accumulating duplicates.
+        let existing = Some(serde_json::json!({
+            "files": [make_file_json("p/sources.jar", "jar")],
+        }));
+        let coords = sample_coords();
+        let new_file = serde_json::json!({
+            "path": "p/sources.jar",
+            "extension": "jar",
+            "storageKey": "maven/p/sources.jar",
+            "sizeBytes": 200,
+            "sha256": "different",
+        });
+        let updated = build_updated_secondary_metadata(
+            existing,
+            &coords,
+            "p/sources.jar",
+            new_file,
+            &serde_json::json!({}),
+        );
+        let files = updated["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        // The new (larger) entry replaced the old one.
+        assert_eq!(files[0]["sizeBytes"].as_i64(), Some(200));
+        assert_eq!(files[0]["sha256"].as_str(), Some("different"));
+    }
+
+    #[test]
+    fn test_build_updated_secondary_metadata_initializes_when_none() {
+        // No existing metadata row at all: function synthesizes GAV fields.
+        let coords = sample_coords();
+        let new_file = make_file_json("com/example/demo/1.0.0/demo-1.0.0.pom", "pom");
+        let updated = build_updated_secondary_metadata(
+            None,
+            &coords,
+            "demo-1.0.0.pom",
+            new_file,
+            &serde_json::json!({}),
+        );
+        assert_eq!(updated["groupId"].as_str(), Some("com.example"));
+        assert_eq!(updated["artifactId"].as_str(), Some("demo"));
+        assert_eq!(updated["version"].as_str(), Some("1.0.0"));
+        assert_eq!(updated["files"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_build_updated_secondary_metadata_non_pom_skips_field_merge() {
+        // Uploading a sources JAR (not a POM) must not pull POM fields
+        // from the file metadata into the artifact metadata.
+        let existing = Some(serde_json::json!({"files": []}));
+        let coords = sample_coords();
+        let new_file = serde_json::json!({
+            "path": "p/demo-1.0.0-sources.jar",
+            "extension": "jar",
+            "classifier": "sources",
+            "storageKey": "maven/p/demo-1.0.0-sources.jar",
+            "sizeBytes": 50,
+            "sha256": "abc",
+        });
+        let file_meta = serde_json::json!({"description": "should not appear"});
+        let updated = build_updated_secondary_metadata(
+            existing,
+            &coords,
+            "demo-1.0.0-sources.jar",
+            new_file,
+            &file_meta,
+        );
+        assert!(updated.get("description").is_none());
+    }
 
     // -----------------------------------------------------------------------
     // parse_metadata_path
