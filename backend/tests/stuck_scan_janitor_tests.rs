@@ -216,6 +216,26 @@ async fn test_cleanup_stuck_scans_leaves_fresh_running_rows_alone() {
         error
     );
 
+    // Zero rows reaped must emit zero SCAN_REAPED audit entries — a regression
+    // that fires an audit row on every tick (even with nothing to reap) would
+    // flood operators' incident-investigation queries.
+    let count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_log
+        WHERE action = 'SCAN_REAPED'
+          AND resource_id IN (SELECT id FROM scan_results WHERE repository_id = $1)
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit entries");
+    assert_eq!(
+        count.0, 0,
+        "no audit entries should be written when no rows are reaped"
+    );
+
     cleanup(&pool, repo_id).await;
 }
 
@@ -278,6 +298,25 @@ async fn test_cleanup_stuck_scans_does_not_touch_terminal_rows() {
         "pre-existing failed row's error_message must not be overwritten"
     );
 
+    // Already-terminal rows must not produce SCAN_REAPED audit entries even
+    // though they predate the threshold. Locks the WHERE filter semantics.
+    let count: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_log
+        WHERE action = 'SCAN_REAPED'
+          AND resource_id = ANY($1)
+        "#,
+    )
+    .bind(&[completed_id, preexisting_failed_id][..])
+    .fetch_one(&pool)
+    .await
+    .expect("count audit entries for terminal rows");
+    assert_eq!(
+        count.0, 0,
+        "terminal-state rows must not produce SCAN_REAPED audit entries"
+    );
+
     cleanup(&pool, repo_id).await;
 }
 
@@ -330,16 +369,25 @@ async fn test_cleanup_stuck_scans_emits_audit_event_per_reaped_row() {
     let fresh_started = chrono::Utc::now() - chrono::Duration::seconds(30);
     let _ = insert_running_scan(&pool, artifact_id, repo_id, fresh_started).await;
 
+    let threshold = Duration::from_secs(30 * 60);
     let cleaned = svc
-        .cleanup_stuck_scans(Duration::from_secs(30 * 60))
+        .cleanup_stuck_scans(threshold)
         .await
         .expect("janitor should succeed");
     assert_eq!(cleaned, 1u64, "exactly one stuck row should be reaped");
 
     // Exactly one SCAN_REAPED audit entry for this scan, with full context.
-    let row: (String, String, Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
+    // `user_id` is included because janitor reaps are system-initiated and the
+    // entry should carry NULL there (no user actor) — locking the convention.
+    let row: (
+        String,
+        String,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<serde_json::Value>,
+    ) = sqlx::query_as(
         r#"
-        SELECT action, resource_type, resource_id, details
+        SELECT action, resource_type, resource_id, user_id, details
         FROM audit_log
         WHERE action = 'SCAN_REAPED'
           AND resource_id = $1
@@ -350,22 +398,31 @@ async fn test_cleanup_stuck_scans_emits_audit_event_per_reaped_row() {
     .await
     .expect("audit_log should have one SCAN_REAPED entry for the reaped scan");
 
+    let stuck_id_str = stuck_id.to_string();
+    let artifact_id_str = artifact_id.to_string();
+    let repo_id_str = repo_id.to_string();
+
     assert_eq!(row.0, "SCAN_REAPED");
     assert_eq!(row.1, "scan_result");
     assert_eq!(row.2, Some(stuck_id));
-    let details = row.3.expect("audit entry should carry details");
+    assert!(
+        row.3.is_none(),
+        "system-initiated janitor reap must set user_id = NULL (got {:?})",
+        row.3
+    );
+    let details = row.4.expect("audit entry should carry details");
     assert_eq!(
         details.get("scan_id").and_then(|v| v.as_str()),
-        Some(stuck_id.to_string().as_str()),
+        Some(stuck_id_str.as_str()),
         "details.scan_id must match the reaped row id"
     );
     assert_eq!(
         details.get("artifact_id").and_then(|v| v.as_str()),
-        Some(artifact_id.to_string().as_str())
+        Some(artifact_id_str.as_str())
     );
     assert_eq!(
         details.get("repository_id").and_then(|v| v.as_str()),
-        Some(repo_id.to_string().as_str())
+        Some(repo_id_str.as_str())
     );
     assert!(
         details.get("started_at").is_some(),
@@ -378,6 +435,17 @@ async fn test_cleanup_stuck_scans_emits_audit_event_per_reaped_row() {
     assert_eq!(
         details.get("reason").and_then(|v| v.as_str()),
         Some("stuck_running_janitor")
+    );
+    assert_eq!(
+        details.get("threshold_secs").and_then(|v| v.as_i64()),
+        Some(threshold.as_secs() as i64),
+        "details.threshold_secs must reflect the configured threshold"
+    );
+    assert_eq!(
+        details.get("actor").and_then(|v| v.as_str()),
+        Some("system:stuck_scan_janitor"),
+        "details.actor must identify this as a system-initiated event so SIEM/SOAR \
+         rules can filter system entries from human-initiated audit traffic"
     );
 
     // Sweep across all rows: exactly one SCAN_REAPED event was written for this
@@ -397,6 +465,31 @@ async fn test_cleanup_stuck_scans_emits_audit_event_per_reaped_row() {
     assert_eq!(
         total.0, 1,
         "exactly one SCAN_REAPED audit event should exist for the repository"
+    );
+
+    // Idempotency: a second pass must reap zero rows and must not duplicate the
+    // audit entry. Locks the WHERE filter against a regression that re-emits
+    // audit rows for already-failed scans.
+    let again = svc
+        .cleanup_stuck_scans(threshold)
+        .await
+        .expect("idempotent second pass should succeed");
+    assert_eq!(again, 0u64, "second pass should reap zero rows");
+    let total_after: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_log
+        WHERE action = 'SCAN_REAPED'
+          AND resource_id IN (SELECT id FROM scan_results WHERE repository_id = $1)
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit entries after second pass");
+    assert_eq!(
+        total_after.0, 1,
+        "second pass must not duplicate audit entries"
     );
 
     cleanup(&pool, repo_id).await;
@@ -437,6 +530,82 @@ async fn test_cleanup_stuck_scans_emits_one_audit_event_per_row_batch() {
     assert_eq!(
         total.0, 5,
         "one SCAN_REAPED audit event per reaped scan_results row"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+// =============================================================================
+// Best-effort audit emission: the doc-comment on cleanup_stuck_scans declares
+// that an audit-log INSERT failure must NOT roll back the reap, since leaving
+// a row wedged in `running` is worse than missing an audit entry. Pin that
+// contract with a test that forces audit INSERTs to fail and verifies the
+// scan_results row is still transitioned to `failed`.
+//
+// Implementation: install a CHECK constraint that rejects SCAN_REAPED rows
+// for the duration of the test, then drop it unconditionally afterwards so
+// schema state does not leak to other tests. Requires --test-threads=1 (the
+// repo convention for #[ignore] integration tests), which the module docstring
+// already documents.
+// =============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_cleanup_stuck_scans_reaps_row_even_when_audit_insert_fails() {
+    let pool = connect_db().await;
+    let repo_id = create_test_repo(&pool).await;
+    let artifact_id = create_test_artifact(&pool, repo_id).await;
+    let svc = ScanResultService::new(pool.clone());
+
+    let stuck_started = chrono::Utc::now() - chrono::Duration::minutes(45);
+    let stuck_id = insert_running_scan(&pool, artifact_id, repo_id, stuck_started).await;
+
+    sqlx::query(
+        "ALTER TABLE audit_log \
+         ADD CONSTRAINT test_block_scan_reaped \
+         CHECK (action <> 'SCAN_REAPED') NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .expect("install CHECK constraint");
+
+    let result = svc.cleanup_stuck_scans(Duration::from_secs(30 * 60)).await;
+
+    // Always drop the constraint, even if the assertion below fails, so the
+    // schema does not leak to subsequent tests in the same DB.
+    let _ = sqlx::query("ALTER TABLE audit_log DROP CONSTRAINT test_block_scan_reaped")
+        .execute(&pool)
+        .await;
+
+    let cleaned = result.expect("reap must succeed even when audit INSERT is rejected");
+    assert_eq!(cleaned, 1, "the stuck row must still be reaped");
+
+    let (status, error) = fetch_status_and_error(&pool, stuck_id).await;
+    assert_eq!(
+        status, "failed",
+        "scan_results row must be transitioned to failed despite audit failure"
+    );
+    assert!(
+        error
+            .as_deref()
+            .map(|s| s.contains("janitor"))
+            .unwrap_or(false),
+        "diagnostic error_message must be set on the reaped row (got {:?})",
+        error
+    );
+
+    // No audit entry exists for this scan — the CHECK rejected the INSERT,
+    // and the janitor swallowed the error at warn level instead of rolling back.
+    let count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'SCAN_REAPED' AND resource_id = $1",
+    )
+    .bind(stuck_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit entries");
+    assert_eq!(
+        count.0, 0,
+        "no audit entry expected when the INSERT was rejected by the CHECK constraint"
     );
 
     cleanup(&pool, repo_id).await;

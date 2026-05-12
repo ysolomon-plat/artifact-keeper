@@ -11,6 +11,13 @@ use crate::models::security::{
 };
 use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 
+/// Maximum rows the stuck-scan janitor reaps in a single tick. Bounds memory
+/// for the `UPDATE ... RETURNING` payload and the audit-emission loop so a
+/// post-upgrade backlog drains across successive ticks rather than in one
+/// large batch. A long-stuck backlog on a normally-healthy install is small;
+/// this only matters for pathological cases (deploy after a long outage).
+const STUCK_SCAN_REAP_LIMIT: i64 = 1000;
+
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
 // ---------------------------------------------------------------------------
@@ -302,7 +309,16 @@ impl ScanResultService {
     /// running -> failed transition is visible to operators investigating an
     /// incident. Audit-log writes are best-effort: a failure to record the
     /// event is logged at warn level but does not roll back the reap, since
-    /// leaving the row wedged in `running` is the worse outcome.
+    /// leaving the row wedged in `running` is the worse outcome. Operators
+    /// auditing completeness should reconcile audit entries against
+    /// `scan_results` rows whose `error_message` begins with `janitor:` —
+    /// the row's terminal state is the source of truth, the audit row is
+    /// the convenience index.
+    ///
+    /// Each tick caps reap count at [`STUCK_SCAN_REAP_LIMIT`] rows via
+    /// `FOR UPDATE SKIP LOCKED` so a deploy-day backlog drains across
+    /// successive ticks instead of in one large in-memory batch, and so
+    /// concurrent janitor replicas do not block on each other.
     ///
     /// Returns the count of rows reaped.
     pub async fn cleanup_stuck_scans(&self, stuck_threshold: Duration) -> Result<u64> {
@@ -316,21 +332,33 @@ impl ScanResultService {
 
         let reaped = sqlx::query!(
             r#"
+            WITH reap AS (
+                SELECT id FROM scan_results
+                WHERE status = 'running'
+                  AND started_at IS NOT NULL
+                  AND started_at < NOW() - make_interval(secs => $2::double precision)
+                ORDER BY started_at
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            )
             UPDATE scan_results
             SET status = 'failed',
                 error_message = $1,
                 completed_at = NOW()
-            WHERE status = 'running'
-              AND started_at IS NOT NULL
-              AND started_at < NOW() - make_interval(secs => $2::double precision)
+            WHERE id IN (SELECT id FROM reap)
             RETURNING id, artifact_id, repository_id, started_at, completed_at
             "#,
             error_message,
             secs as f64,
+            STUCK_SCAN_REAP_LIMIT,
         )
         .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if reaped.is_empty() {
+            return Ok(0);
+        }
 
         // Per-row audit emission (#1063). A scan transitioning running -> failed
         // without operator action is security-relevant: an in-flight vulnerability
@@ -347,6 +375,7 @@ impl ScanResultService {
                 "reaped_at": row.completed_at,
                 "threshold_secs": secs,
                 "reason": "stuck_running_janitor",
+                "actor": "system:stuck_scan_janitor",
             });
             let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
                 .resource(row.id)
