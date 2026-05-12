@@ -17,8 +17,18 @@
 --
 -- CREATE INDEX CONCURRENTLY is not used here: sqlx::migrate runs every
 -- migration file inside a transaction, and CONCURRENTLY is rejected inside
--- a transaction block. Stuck-scan rows are bounded in count (the janitor
--- prunes them every 10 min) so the BUILD scan time at upgrade is short.
+-- a transaction block. The non-concurrent build takes ACCESS EXCLUSIVE on
+-- scan_results for the duration of the build, so inserts to scan_results
+-- (i.e. new scans starting) will block until it finishes.
+--
+-- First-deploy honesty: on installs that pre-date #1015's janitor, the
+-- 'running' set on disk is unbounded -- it accumulates every historical
+-- crashed-mid-scan row. Build time at this migration is proportional to
+-- that backlog, NOT to the janitor's steady-state bound (the janitor has
+-- not run yet at migration time). Operators with a large pre-existing
+-- backlog should size the upgrade window using the SQL count in the
+-- CHANGELOG pre-upgrade-check section.
+--
 -- Idempotent via IF NOT EXISTS so re-running on an already-migrated DB is
 -- a no-op.
 

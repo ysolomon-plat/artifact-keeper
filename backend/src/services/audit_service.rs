@@ -173,6 +173,13 @@ impl AuditEntry {
         self
     }
 
+    /// Attach an arbitrary JSON payload to this audit entry's `details` column.
+    ///
+    /// Reserved key: `details.actor`. System-initiated audit emitters use this
+    /// to advertise themselves to SIEM filters (e.g. `"system:stuck_scan_janitor"`
+    /// in #1063). Callers MUST NOT populate `details.actor` from user-controlled
+    /// input — doing so would let an attacker spoof system-actor entries in
+    /// downstream queries. Use the `user_id` column for human actors.
     pub fn details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(details);
         self

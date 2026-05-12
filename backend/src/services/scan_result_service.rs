@@ -309,11 +309,22 @@ impl ScanResultService {
     /// running -> failed transition is visible to operators investigating an
     /// incident. Audit-log writes are best-effort: a failure to record the
     /// event is logged at warn level but does not roll back the reap, since
-    /// leaving the row wedged in `running` is the worse outcome. Operators
-    /// auditing completeness should reconcile audit entries against
-    /// `scan_results` rows whose `error_message` begins with `janitor:` —
-    /// the row's terminal state is the source of truth, the audit row is
-    /// the convenience index.
+    /// leaving the row wedged in `running` is the worse outcome. Within the
+    /// audit retention window, operators should reconcile audit entries
+    /// against `scan_results` rows whose `error_message` begins with
+    /// `janitor:` — together these are the in-DB evidence pair.
+    ///
+    /// Durability caveats — neither half of the pair is a long-term
+    /// compliance store:
+    ///   * `audit_log.action='SCAN_REAPED'` entries are deleted by the
+    ///     `audit_retention_days` retention sweep (default 90 days, see
+    ///     `AuditService::cleanup`).
+    ///   * The `scan_results` row itself is `ON DELETE CASCADE` from
+    ///     `artifacts` and `repositories`, so deleting a repo destroys
+    ///     its reaped-row evidence independently of audit retention.
+    ///
+    /// For SOC 2 / FedRAMP / ISO 27001 long-term retention requirements,
+    /// export `SCAN_REAPED` audit entries to durable SIEM storage.
     ///
     /// Each tick caps reap count at [`STUCK_SCAN_REAP_LIMIT`] rows via
     /// `FOR UPDATE SKIP LOCKED` so a deploy-day backlog drains across

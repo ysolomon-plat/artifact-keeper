@@ -16,8 +16,16 @@
 //!     -e POSTGRES_DB=artifact_registry docker.io/library/postgres:16
 //! # apply backend/migrations/*.sql
 //! DATABASE_URL="postgres://registry:registry@localhost:35432/artifact_registry" \
-//!     cargo test --test stuck_scan_janitor_tests -- --ignored
+//!     cargo test --test stuck_scan_janitor_tests -- --ignored --test-threads=1
 //! ```
+//!
+//! **`--test-threads=1` is required**, not a suggestion: the audit-failure
+//! test installs a table-level CHECK constraint on `audit_log` for the
+//! duration of its run. Other tests in this file that emit `SCAN_REAPED`
+//! audit rows would be rejected by that constraint if they ran in parallel.
+//! The constraint is also globally visible to any other process connected
+//! to the same `audit_log` table — run this suite against a per-process DB
+//! (the `podman run` above creates one), not a shared CI database.
 #![cfg(test)]
 
 use sqlx::PgPool;
