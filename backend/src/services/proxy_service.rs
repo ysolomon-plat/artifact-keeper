@@ -107,6 +107,65 @@ const TEE_CHANNEL_DEPTH: usize = 64;
 /// the status-classification logic can be unit-tested without a real
 /// `reqwest::Response`.
 ///
+/// Parse an APT `Release` (or `InRelease`) file body and return every
+/// distribution-relative file path listed under any checksum section
+/// (`MD5Sum`, `SHA1`, `SHA256`, `SHA512`). Used by
+/// `ProxyService::invalidate_dist_packages_cache` to identify which
+/// sibling cache entries must be evicted when the upstream Release
+/// changes (#1147).
+///
+/// The Release file format documents each section as a header line
+/// (`SHA256:`) followed by indented entries of the form
+/// `<hex_digest> <size> <relative_path>`. Lines starting with `-----`
+/// belong to the inline-signature wrapper around an `InRelease` body
+/// and are ignored. The returned `Vec` is de-duplicated while preserving
+/// first-seen order.
+fn parse_release_file_paths(release_content: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut paths: Vec<String> = Vec::new();
+    let mut in_checksum_section = false;
+
+    for line in release_content.lines() {
+        if line.starts_with("-----BEGIN") || line.starts_with("-----END") {
+            continue;
+        }
+        // Section header: a line whose first non-whitespace char is at
+        // column 0 (no leading indent) and that ends with ':'.
+        if !line.starts_with(' ') && !line.starts_with('\t') && line.trim_end().ends_with(':') {
+            let key = line.trim_end().trim_end_matches(':');
+            in_checksum_section = matches!(key, "MD5Sum" | "SHA1" | "SHA256" | "SHA512");
+            continue;
+        }
+        if !in_checksum_section {
+            continue;
+        }
+        // Entry line: `<hex> <size> <relative_path>`. The hex digest and
+        // the size live in the first two whitespace-separated columns;
+        // everything after is the path.
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let _hex = match parts.next() {
+            Some(h) if !h.is_empty() => h,
+            _ => continue,
+        };
+        let _size = match parts.next() {
+            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
+            _ => continue,
+        };
+        let rest: String = parts.collect::<Vec<_>>().join(" ");
+        if rest.is_empty() || rest.contains("..") {
+            continue;
+        }
+        if seen.insert(rest.clone()) {
+            paths.push(rest);
+        }
+    }
+    paths
+}
+
 /// * `404` → `AppError::NotFound` (cache-miss-class error; callers treat
 ///   as a real "upstream doesn't have it" signal, not a backend failure)
 /// * Other non-2xx → `AppError::Storage` (transient/upstream-misconfig
@@ -691,6 +750,101 @@ impl ProxyService {
         let _ = self.storage.delete(&metadata_key).await;
 
         Ok(())
+    }
+
+    /// Invalidate cached artifact by repo key alone.
+    ///
+    /// Same effect as `invalidate_cache` but doesn't require constructing
+    /// a `Repository` value. Useful for handlers that only carry a thin
+    /// `RepoInfo` and need to evict sibling cache entries (e.g. APT
+    /// invalidating stale Packages indices when Release changes, #1147).
+    pub async fn invalidate_cache_by_key(&self, repo_key: &str, path: &str) -> Result<()> {
+        let cache_key = Self::cache_storage_key(repo_key, path)?;
+        let metadata_key = Self::cache_metadata_key(repo_key, path)?;
+        let _ = self.storage.delete(&cache_key).await;
+        let _ = self.storage.delete(&metadata_key).await;
+        Ok(())
+    }
+
+    /// Fetch an artifact from upstream and report whether the content
+    /// differs from what was previously cached.
+    ///
+    /// Returns `(content, content_type, changed)` where `changed` is:
+    ///   * `true` when the previous cache entry was missing/expired AND
+    ///     the new upstream body differs from any stale cached body, or
+    ///     when there was no cached body to compare against,
+    ///   * `false` when the upstream returned the same SHA-256 we already
+    ///     had cached.
+    ///
+    /// Use this for APT `Release`/`InRelease` (#1147) so the handler can
+    /// invalidate sibling `Packages*` caches in lockstep when upstream
+    /// publishes a new index and the hashes no longer match.
+    pub async fn fetch_dists_detecting_change(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<(Bytes, Option<String>, bool)> {
+        let cache_key = Self::cache_storage_key(&repo.key, path)?;
+
+        // Capture the SHA of any currently-cached body (fresh or stale) so
+        // we can compare to whatever the upstream now serves.
+        let prior_sha = match self.storage.get(&cache_key).await {
+            Ok(prior) => {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&prior);
+                Some(format!("{:x}", hasher.finalize()))
+            }
+            Err(_) => None,
+        };
+
+        // Force a fresh upstream fetch by invalidating any current cache
+        // entry before delegating. This guarantees we observe the latest
+        // upstream Release when the caller's intent is to drive cache
+        // coherence across sibling Packages indices.
+        let _ = self.invalidate_cache_by_key(&repo.key, path).await;
+
+        let (content, content_type) = self.fetch_artifact(repo, path).await?;
+
+        let new_sha = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&content);
+            format!("{:x}", hasher.finalize())
+        };
+        let changed = match prior_sha {
+            Some(s) => s != new_sha,
+            None => true,
+        };
+        Ok((content, content_type, changed))
+    }
+
+    /// Invalidate every cached file referenced from an APT Release file
+    /// for a given distribution (#1147).
+    ///
+    /// The Release file lists every `Packages`, `Packages.gz`,
+    /// `Packages.xz`, `Translation-*`, `Contents-*`, `Components-*`, etc.
+    /// path under the distribution along with their SHA-256 hashes. When
+    /// upstream publishes new packages the hashes change but the per-file
+    /// caches keep serving the old bodies until their own TTL expires,
+    /// which is what causes `apt-get update` to fail with
+    /// `Hash Sum mismatch`.
+    ///
+    /// Given the freshly-fetched Release body and its distribution name,
+    /// parse the `SHA256:` section and invalidate every referenced path's
+    /// cache entry under `dists/<distribution>/`. The Release entry itself
+    /// is *not* invalidated by this method; callers fetch and refresh it
+    /// through `fetch_dists_detecting_change` first.
+    pub async fn invalidate_dist_packages_cache(
+        &self,
+        repo_key: &str,
+        distribution: &str,
+        release_content: &str,
+    ) {
+        for relative in parse_release_file_paths(release_content) {
+            let path = format!("dists/{}/{}", distribution, relative);
+            let _ = self.invalidate_cache_by_key(repo_key, &path).await;
+        }
     }
 
     /// Get cache TTL configuration for a repository.
@@ -2246,6 +2400,110 @@ mod tests {
             ),
             "https://example.com/path%20with%20spaces/artifact"
         );
+    }
+
+    // =======================================================================
+    // parse_release_file_paths (APT Release file parsing for #1147)
+    // =======================================================================
+
+    #[test]
+    fn test_parse_release_file_paths_extracts_sha256_section() {
+        let release = "\
+Origin: Debian
+Suite: stable
+SHA256:
+ abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789  1234 main/binary-amd64/Packages
+ fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210   567 main/binary-amd64/Packages.gz
+";
+        let paths = parse_release_file_paths(release);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"main/binary-amd64/Packages".to_string()));
+        assert!(paths.contains(&"main/binary-amd64/Packages.gz".to_string()));
+    }
+
+    #[test]
+    fn test_parse_release_file_paths_dedupes_across_sections() {
+        // The same path appears under MD5Sum, SHA1, and SHA256 — the
+        // returned list dedupes so cache invalidation is idempotent.
+        let release = "\
+MD5Sum:
+ 00000000000000000000000000000000  1234 main/binary-amd64/Packages
+SHA1:
+ 1111111111111111111111111111111111111111  1234 main/binary-amd64/Packages
+SHA256:
+ 22222222222222222222222222222222222222222222222222222222222222  1234 main/binary-amd64/Packages
+";
+        let paths = parse_release_file_paths(release);
+        assert_eq!(paths, vec!["main/binary-amd64/Packages".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_release_file_paths_ignores_inrelease_armor() {
+        // InRelease files are inline-signed: the body is wrapped in
+        // `-----BEGIN PGP SIGNED MESSAGE-----` armor lines that must
+        // not be misread as section headers.
+        let release = "\
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA256
+
+Origin: Debian
+SHA256:
+ abc123 1234 main/Contents-amd64
+-----BEGIN PGP SIGNATURE-----
+iQIzBAEBCgAdFiE...
+-----END PGP SIGNATURE-----
+";
+        let paths = parse_release_file_paths(release);
+        assert_eq!(paths, vec!["main/Contents-amd64".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_release_file_paths_skips_traversal_entries() {
+        // A malicious upstream could try to smuggle a `..` path; reject
+        // it so cache invalidation can't be aimed at unrelated keys.
+        let release = "\
+SHA256:
+ abc 100 ../../etc/passwd
+ def 200 main/binary-amd64/Packages
+";
+        let paths = parse_release_file_paths(release);
+        assert_eq!(paths, vec!["main/binary-amd64/Packages".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_release_file_paths_skips_lines_outside_checksum_sections() {
+        // Lines under non-checksum sections (e.g. Date, MD5Sum-Description)
+        // must not contribute paths. Section headers reset the state.
+        let release = "\
+Origin: Debian
+Suite: stable
+Components: main contrib non-free
+SHA256:
+ abc 100 main/binary-amd64/Packages
+Description:
+ dummy line that looks like an entry but is in a different section
+";
+        let paths = parse_release_file_paths(release);
+        assert_eq!(paths, vec!["main/binary-amd64/Packages".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_release_file_paths_handles_empty_input() {
+        assert!(parse_release_file_paths("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_release_file_paths_skips_malformed_entries() {
+        // Entries missing the size column, or whose size is non-numeric,
+        // are dropped so we don't construct bogus cache paths from them.
+        let release = "\
+SHA256:
+ abc main/incomplete
+ def notanumber main/bad-size
+ ghi 999 main/good
+";
+        let paths = parse_release_file_paths(release);
+        assert_eq!(paths, vec!["main/good".to_string()]);
     }
 
     // =======================================================================

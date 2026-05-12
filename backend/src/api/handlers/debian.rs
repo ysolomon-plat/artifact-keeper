@@ -397,6 +397,27 @@ impl<'a> DebianProxy<'a> {
         content_type: &'static str,
         repo: &RepoInfo,
     ) -> Result<(), Response> {
+        // Virtual repos: try each Remote member in priority order so a
+        // virtual APT repo can serve dists metadata when its top-level
+        // type is `virtual` (#1147). Local/Staging members produce
+        // their dists metadata locally, handled by the caller's
+        // post-`dists()` fallthrough, so we only need to handle Remote.
+        if repo.repo_type == RepositoryType::Virtual {
+            let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+            if let Some(resp) = try_virtual_dists(
+                self.state,
+                repo.id,
+                self.repo_key,
+                &upstream_path,
+                content_type,
+            )
+            .await?
+            {
+                return Err(resp);
+            }
+            return Ok(());
+        }
+
         if repo.repo_type != RepositoryType::Remote {
             return Ok(());
         }
@@ -418,6 +439,224 @@ impl<'a> DebianProxy<'a> {
             .body(Body::from(content))
             .unwrap())
     }
+
+    /// Variant of `dists` that also detects whether the upstream content
+    /// changed since the last cached copy. When it has, sibling Packages
+    /// caches under the same distribution are invalidated so subsequent
+    /// `apt-get update` requests refetch them and the Release SHA-256
+    /// list matches what apt sees (#1147).
+    ///
+    /// Used by the Release / InRelease handlers, where stale Packages
+    /// caches manifest as `Hash Sum mismatch` errors on the client.
+    async fn dists_detecting_change(
+        &self,
+        suffix: &str,
+        content_type: &'static str,
+        repo: &RepoInfo,
+    ) -> Result<(), Response> {
+        let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+
+        // Virtual: iterate Remote members. Whichever member serves the
+        // Release also owns the sibling Packages caches we may need to
+        // invalidate, so we run the change-detection probe against that
+        // specific member before returning.
+        if repo.repo_type == RepositoryType::Virtual {
+            if let Some(resp) = try_virtual_dists_detecting_change(
+                self.state,
+                repo.id,
+                self.repo_key,
+                self.distribution,
+                &upstream_path,
+                content_type,
+            )
+            .await?
+            {
+                return Err(resp);
+            }
+            return Ok(());
+        }
+
+        if repo.repo_type != RepositoryType::Remote {
+            return Ok(());
+        }
+        let (upstream_url, proxy) = match (&repo.upstream_url, &self.state.proxy_service) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return Ok(()),
+        };
+
+        let pseudo_repo = build_pseudo_remote(repo.id, self.repo_key, upstream_url);
+        let (content, upstream_ct, changed) = proxy
+            .fetch_dists_detecting_change(&pseudo_repo, &upstream_path)
+            .await
+            .map_err(map_proxy_err)?;
+
+        if changed {
+            if let Ok(text) = std::str::from_utf8(&content) {
+                proxy
+                    .invalidate_dist_packages_cache(self.repo_key, self.distribution, text)
+                    .await;
+            }
+        }
+
+        Err(Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                CONTENT_TYPE,
+                upstream_ct.unwrap_or_else(|| content_type.to_string()),
+            )
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .body(Body::from(content))
+            .unwrap())
+    }
+}
+
+/// Iterate the virtual repo's Remote members for `upstream_path` and
+/// return the first successful response.
+async fn try_virtual_dists(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    upstream_path: &str,
+    default_content_type: &'static str,
+) -> Result<Option<Response>, Response> {
+    let _ = virtual_repo_key;
+    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    for member in &members {
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let Some(upstream_url) = member.upstream_url.as_deref() else {
+            continue;
+        };
+        match proxy_helpers::proxy_fetch(proxy, member.id, &member.key, upstream_url, upstream_path)
+            .await
+        {
+            Ok((content, upstream_ct)) => {
+                return Ok(Some(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(
+                            CONTENT_TYPE,
+                            upstream_ct.unwrap_or_else(|| default_content_type.to_string()),
+                        )
+                        .header(CONTENT_LENGTH, content.len().to_string())
+                        .body(Body::from(content))
+                        .unwrap(),
+                ));
+            }
+            Err(_) => {
+                // Try the next member.
+                continue;
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Change-detection variant of [`try_virtual_dists`]. Used for
+/// Release/InRelease so that any upstream change invalidates the matching
+/// member's sibling `Packages*` caches before the client tries to fetch
+/// them (#1147).
+async fn try_virtual_dists_detecting_change(
+    state: &SharedState,
+    virtual_repo_id: uuid::Uuid,
+    virtual_repo_key: &str,
+    distribution: &str,
+    upstream_path: &str,
+    default_content_type: &'static str,
+) -> Result<Option<Response>, Response> {
+    let _ = virtual_repo_key;
+    let members = proxy_helpers::fetch_virtual_members(&state.db, virtual_repo_id).await?;
+    let Some(proxy) = state.proxy_service.as_deref() else {
+        return Ok(None);
+    };
+    for member in &members {
+        if member.repo_type != RepositoryType::Remote {
+            continue;
+        }
+        let Some(upstream_url) = member.upstream_url.as_deref() else {
+            continue;
+        };
+        let pseudo_repo = build_pseudo_remote(member.id, &member.key, upstream_url);
+        match proxy
+            .fetch_dists_detecting_change(&pseudo_repo, upstream_path)
+            .await
+        {
+            Ok((content, upstream_ct, changed)) => {
+                if changed {
+                    if let Ok(text) = std::str::from_utf8(&content) {
+                        proxy
+                            .invalidate_dist_packages_cache(&member.key, distribution, text)
+                            .await;
+                    }
+                }
+                return Ok(Some(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(
+                            CONTENT_TYPE,
+                            upstream_ct.unwrap_or_else(|| default_content_type.to_string()),
+                        )
+                        .header(CONTENT_LENGTH, content.len().to_string())
+                        .body(Body::from(content))
+                        .unwrap(),
+                ));
+            }
+            Err(_) => continue,
+        }
+    }
+    Ok(None)
+}
+
+/// Build a minimal `Repository` value suitable for
+/// `ProxyService::fetch_dists_detecting_change`, which only needs `id`,
+/// `key`, `repo_type`, and `upstream_url`.
+fn build_pseudo_remote(
+    id: uuid::Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+) -> crate::models::repository::Repository {
+    use crate::models::repository::{
+        ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
+    };
+    Repository {
+        id,
+        key: repo_key.to_string(),
+        name: repo_key.to_string(),
+        description: None,
+        format: RepositoryFormat::Debian,
+        repo_type: RepositoryType::Remote,
+        storage_backend: "filesystem".to_string(),
+        storage_path: String::new(),
+        upstream_url: Some(upstream_url.to_string()),
+        is_public: false,
+        quota_bytes: None,
+        replication_priority: ReplicationPriority::OnDemand,
+        promotion_target_id: None,
+        promotion_policy_id: None,
+        curation_enabled: false,
+        curation_source_repo_id: None,
+        curation_target_repo_id: None,
+        curation_default_action: "allow".to_string(),
+        curation_sync_interval_secs: 0,
+        curation_auto_fetch: false,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn map_proxy_err(e: crate::error::AppError) -> Response {
+    match e {
+        crate::error::AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+        other => (
+            StatusCode::BAD_GATEWAY,
+            format!("Upstream fetch failed: {}", other),
+        )
+            .into_response(),
+    }
 }
 
 /// Generate the Release content locally (shared by Release, InRelease,
@@ -438,7 +677,7 @@ async fn release_file(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     proxy
-        .dists("Release", "text/plain; charset=utf-8", &repo)
+        .dists_detecting_change("Release", "text/plain; charset=utf-8", &repo)
         .await?;
 
     let (release, _) = local_release_content(&state, &repo_key, &distribution).await?;
@@ -460,7 +699,7 @@ async fn in_release_file(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     proxy
-        .dists("InRelease", "text/plain; charset=utf-8", &repo)
+        .dists_detecting_change("InRelease", "text/plain; charset=utf-8", &repo)
         .await?;
 
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
@@ -492,6 +731,9 @@ async fn release_gpg(
     Path((repo_key, distribution)): Path<(String, String)>,
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
+    // Release.gpg is the detached signature of Release. We do not need
+    // change-detection here because the matching Release fetch (called
+    // by apt before Release.gpg) already drove invalidation.
     proxy
         .dists("Release.gpg", "application/pgp-signature", &repo)
         .await?;
@@ -760,6 +1002,23 @@ async fn dists_proxy_catchall(
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
+    let upstream_path = format!("dists/{}/{}", distribution, dists_path);
+
+    // Virtual repos: walk Remote members in priority order so a Virtual
+    // APT repo can serve i18n / Translation / dep11 / Sources etc. just
+    // like Release/Packages handlers (#1147).
+    if repo.repo_type == RepositoryType::Virtual {
+        let resp = try_virtual_dists(
+            &state,
+            repo.id,
+            &repo_key,
+            &upstream_path,
+            "text/plain; charset=utf-8",
+        )
+        .await?;
+        return resp.ok_or_else(|| (StatusCode::NOT_FOUND, "Not found").into_response());
+    }
+
     if repo.repo_type != RepositoryType::Remote {
         return Err((StatusCode::NOT_FOUND, "Not found").into_response());
     }
@@ -769,7 +1028,6 @@ async fn dists_proxy_catchall(
         _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
     };
 
-    let upstream_path = format!("dists/{}/{}", distribution, dists_path);
     let (content, upstream_ct) =
         proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path).await?;
 

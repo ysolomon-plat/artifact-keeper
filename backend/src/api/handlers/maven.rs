@@ -1435,6 +1435,77 @@ async fn update_artifact_record(
     Ok(())
 }
 
+/// Append a freshly-uploaded secondary file to an existing artifact's
+/// `metadata.files` array and merge POM-parsed fields when the upload is
+/// a POM. Used by both the SNAPSHOT primary re-upload path and the
+/// secondary-file path so the two arms share a single source of truth
+/// for grouped file metadata (#1092).
+///
+/// `existing_meta` is the metadata JSON loaded for `existing_id` before
+/// the upload, or `None` if no metadata row existed yet. On return the
+/// metadata row reflects the appended file and any merged POM fields.
+async fn append_secondary_file_to_metadata(
+    db: &sqlx::PgPool,
+    existing_id: uuid::Uuid,
+    existing_meta: Option<serde_json::Value>,
+    coords: &MavenCoordinates,
+    path: &str,
+    new_file: serde_json::Value,
+    file_metadata: &serde_json::Value,
+) {
+    let mut updated_meta = existing_meta.unwrap_or_else(|| {
+        serde_json::json!({
+            "groupId": coords.group_id,
+            "artifactId": coords.artifact_id,
+            "version": coords.version,
+        })
+    });
+
+    let mut files = updated_meta
+        .get("files")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    // Dedupe by path so a SNAPSHOT classifier re-upload replaces its
+    // previous entry rather than accumulating duplicates over time.
+    let new_path = new_file
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    if let Some(ref np) = new_path {
+        files.retain(|f| f.get("path").and_then(|v| v.as_str()) != Some(np.as_str()));
+    }
+    files.push(new_file);
+    updated_meta["files"] = serde_json::Value::Array(files);
+
+    if MavenHandler::is_pom(path) {
+        for key in &["name", "description", "url", "dependencies"] {
+            if let Some(val) = file_metadata.get(*key) {
+                if updated_meta.get(*key).is_none() {
+                    updated_meta[*key] = val.clone();
+                }
+            }
+        }
+    }
+
+    let _ = sqlx::query(
+        r#"
+        INSERT INTO artifact_metadata (artifact_id, format, metadata)
+        VALUES ($1, 'maven', $2)
+        ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
+        "#,
+    )
+    .bind(existing_id)
+    .bind(&updated_meta)
+    .execute(db)
+    .await;
+
+    let _ = sqlx::query("UPDATE artifacts SET updated_at = NOW() WHERE id = $1")
+        .bind(existing_id)
+        .execute(db)
+        .await;
+}
+
 // ---------------------------------------------------------------------------
 // PUT /maven/{repo_key}/*path — Upload artifact
 // ---------------------------------------------------------------------------
@@ -1677,7 +1748,7 @@ async fn upload(
                 .await;
             } else if is_primary && coords.version.contains("SNAPSHOT") {
                 // SNAPSHOT re-upload: update the artifact record, then fall
-                // through to shared metadata update below.
+                // through to the shared metadata update below.
                 update_artifact_record(
                     &state.db,
                     repo.id,
@@ -1689,51 +1760,36 @@ async fn upload(
                     &storage_key,
                 )
                 .await?;
-                // Secondary file (POM when JAR exists, or classifier like sources/javadoc).
-                // Add it to the existing artifact's metadata files array.
-                let mut updated_meta = existing_meta.unwrap_or_else(|| {
-                    serde_json::json!({
-                        "groupId": coords.group_id,
-                        "artifactId": coords.artifact_id,
-                        "version": coords.version,
-                    })
-                });
-
-                let mut files = updated_meta
-                    .get("files")
-                    .and_then(|f| f.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                files.push(new_file);
-                updated_meta["files"] = serde_json::Value::Array(files);
-
-                // Merge POM-parsed fields if this is a POM upload
-                if MavenHandler::is_pom(&path) {
-                    for key in &["name", "description", "url", "dependencies"] {
-                        if let Some(val) = file_metadata.get(*key) {
-                            if updated_meta.get(*key).is_none() {
-                                updated_meta[*key] = val.clone();
-                            }
-                        }
-                    }
-                }
-
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO artifact_metadata (artifact_id, format, metadata)
-                    VALUES ($1, 'maven', $2)
-                    ON CONFLICT (artifact_id) DO UPDATE SET metadata = $2
-                    "#,
+                append_secondary_file_to_metadata(
+                    &state.db,
+                    existing_id,
+                    existing_meta,
+                    &coords,
+                    &path,
+                    new_file,
+                    &file_metadata,
                 )
-                .bind(existing_id)
-                .bind(&updated_meta)
-                .execute(&state.db)
                 .await;
-
-                let _ = sqlx::query("UPDATE artifacts SET updated_at = NOW() WHERE id = $1")
-                    .bind(existing_id)
-                    .execute(&state.db)
-                    .await;
+            } else {
+                // Secondary file uploaded after the primary already exists
+                // (POM following a JAR, sources/javadoc/test classifiers,
+                // non-SNAPSHOT primary classifier re-uploads, etc.).
+                // Previously this branch was a no-op so secondary files
+                // were saved to object storage but not recorded against
+                // any artifact row, leaving them invisible to repository
+                // listing APIs (#1092). Record them in the existing
+                // artifact's metadata.files so the storage fallback path
+                // can serve them and the listing path can surface them.
+                append_secondary_file_to_metadata(
+                    &state.db,
+                    existing_id,
+                    existing_meta,
+                    &coords,
+                    &path,
+                    new_file,
+                    &file_metadata,
+                )
+                .await;
             }
         }
         None => {

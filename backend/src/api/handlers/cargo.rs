@@ -1098,6 +1098,16 @@ async fn try_remote_index(
 /// NOTE: This does not use `resolve_virtual_metadata` because cargo index
 /// resolution honours `index_upstream_url` config overrides for the proxy
 /// URL, which the shared helper does not know about.
+///
+/// Aggregation semantics (matches helm/conda/cran/rubygems and #1143):
+///
+/// * Visit every member in priority order rather than stopping at the first
+///   member that has data. A virtual cargo repo with both a Local fork and a
+///   Remote upstream must surface versions from both, not just the first.
+/// * Within a single response, dedupe NDJSON entries by `(name, vers)`. When
+///   the same `(name, vers)` appears in more than one member, the entry from
+///   the higher-priority member (earlier in the iteration order) wins, which
+///   matches the artifact-listing precedence used elsewhere.
 async fn try_virtual_index(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1142,7 +1152,13 @@ async fn try_virtual_index(
 
     let index_path = cargo_sparse_index_path_upstream(name_lower);
 
-    // Iterate members in priority order. For each member, pick the lookup
+    // Accumulate NDJSON entries across all members. Use a LinkedHashMap-style
+    // ordered set keyed by version so that:
+    //   * iteration order = first-seen order = priority order;
+    //   * a `(name, vers)` already inserted by a higher-priority member is
+    //     not overwritten by a lower-priority member's entry.
+    //
+    // Visit every member in priority order. For each member, pick the lookup
     // strategy that matches its type:
     //
     // * Remote members go straight through the proxy (ProxyService consults
@@ -1157,6 +1173,9 @@ async fn try_virtual_index(
     // * Local and Staging members have no proxy cache; the artifacts table is
     //   the authoritative source for the crates they host. We build the index
     //   from their rows exactly as we do for the top-level hosted case.
+    let mut aggregated: Vec<String> = Vec::new();
+    let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for member in &members {
         match member.repo_type {
             RepositoryType::Remote => {
@@ -1171,7 +1190,7 @@ async fn try_virtual_index(
                     .cloned()
                     .unwrap_or_else(|| upstream_url.clone());
 
-                if let Ok((content, content_type)) = proxy_helpers::proxy_fetch(
+                if let Ok((content, _content_type)) = proxy_helpers::proxy_fetch(
                     proxy,
                     member.id,
                     &member.key,
@@ -1180,8 +1199,7 @@ async fn try_virtual_index(
                 )
                 .await
                 {
-                    index_cache_set(index_cache, cache_key.to_string(), content.clone());
-                    return Some(Ok(index_response(content, content_type)));
+                    merge_index_lines(&content, &mut aggregated, &mut seen_versions);
                 }
             }
             RepositoryType::Local | RepositoryType::Staging => {
@@ -1193,6 +1211,7 @@ async fn try_virtual_index(
                     LEFT JOIN artifact_metadata am ON am.artifact_id = a.id
                     WHERE a.repository_id = $1
                       AND a.name = $2
+                      AND a.version IS NOT NULL
                       AND a.is_deleted = false
                     ORDER BY a.created_at ASC
                     "#,
@@ -1206,23 +1225,15 @@ async fn try_virtual_index(
                     Vec::new()
                 });
 
-                if !rows.is_empty() {
-                    let lines: Vec<String> = rows
-                        .iter()
-                        .map(|row| {
-                            let vers: Option<String> = row.get("version");
-                            let vers = vers.as_deref().unwrap_or("0.0.0");
-                            let cksum: String = row.get("checksum_sha256");
-                            let meta: Option<serde_json::Value> = row.get("metadata");
-                            build_index_entry(name_lower, vers, &cksum, meta.as_ref())
-                        })
-                        .collect();
-                    let body = bytes::Bytes::from(lines.join("\n"));
-                    index_cache_set(index_cache, cache_key.to_string(), body.clone());
-                    return Some(Ok(index_response(
-                        body,
-                        Some("application/json".to_string()),
-                    )));
+                for row in &rows {
+                    let vers: Option<String> = row.get("version");
+                    let Some(vers) = vers else { continue };
+                    if !seen_versions.insert(vers.clone()) {
+                        continue;
+                    }
+                    let cksum: String = row.get("checksum_sha256");
+                    let meta: Option<serde_json::Value> = row.get("metadata");
+                    aggregated.push(build_index_entry(name_lower, &vers, &cksum, meta.as_ref()));
                 }
             }
             RepositoryType::Virtual => {
@@ -1233,10 +1244,56 @@ async fn try_virtual_index(
         }
     }
 
-    Some(Err(AppError::NotFound(
-        "Artifact not found in any member repository".to_string(),
-    )
-    .into_response()))
+    if aggregated.is_empty() {
+        return Some(Err(AppError::NotFound(
+            "Artifact not found in any member repository".to_string(),
+        )
+        .into_response()));
+    }
+
+    let body = bytes::Bytes::from(aggregated.join("\n"));
+    index_cache_set(index_cache, cache_key.to_string(), body.clone());
+    Some(Ok(index_response(
+        body,
+        Some("application/json".to_string()),
+    )))
+}
+
+/// Merge sparse-index NDJSON lines from one member into the running
+/// aggregate, skipping any line whose `vers` field has already been
+/// contributed by a higher-priority member. Lines that fail to parse as
+/// JSON or are missing `vers` are preserved at the cost of dedup so the
+/// client still sees them, matching the helm/conda merge behaviour for
+/// malformed upstream data.
+fn merge_index_lines(
+    content: &[u8],
+    aggregated: &mut Vec<String>,
+    seen_versions: &mut std::collections::HashSet<String>,
+) {
+    let text = match std::str::from_utf8(content) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("vers").and_then(|x| x.as_str()).map(String::from))
+        {
+            Some(vers) => {
+                if seen_versions.insert(vers) {
+                    aggregated.push(line.to_string());
+                }
+            }
+            None => {
+                // Unparseable line: keep it so we don't silently drop data,
+                // but don't track it in the dedup set.
+                aggregated.push(line.to_string());
+            }
+        }
+    }
 }
 
 /// Serve the sparse index file for a crate (one JSON object per version, per line).
@@ -1391,6 +1448,62 @@ mod tests {
             "links": null,
             "rust_version": "1.70.0"
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_index_lines (virtual repo NDJSON aggregation, #1143)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_index_lines_first_member_wins_on_collision() {
+        // Local member already contributed serde 1.0.0; the upstream's
+        // serde 1.0.0 line must not overwrite it. Higher-priority
+        // member's `cksum` is preserved.
+        let mut aggregated: Vec<String> = vec![
+            r#"{"name":"serde","vers":"1.0.0","cksum":"LOCAL"}"#.to_string()
+        ];
+        let mut seen: std::collections::HashSet<String> =
+            ["1.0.0".to_string()].into_iter().collect();
+        let upstream = b"{\"name\":\"serde\",\"vers\":\"1.0.0\",\"cksum\":\"UPSTREAM\"}\n{\"name\":\"serde\",\"vers\":\"1.0.1\",\"cksum\":\"UPSTREAM\"}";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        // 1.0.0 stays as LOCAL, 1.0.1 added from upstream.
+        assert_eq!(aggregated.len(), 2);
+        assert!(aggregated[0].contains("LOCAL"));
+        assert!(aggregated[1].contains("1.0.1"));
+        assert!(seen.contains("1.0.0"));
+        assert!(seen.contains("1.0.1"));
+    }
+
+    #[test]
+    fn test_merge_index_lines_skips_blank_lines() {
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let upstream = b"\n\n{\"name\":\"foo\",\"vers\":\"0.1.0\"}\n\n";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        assert_eq!(aggregated.len(), 1);
+    }
+
+    #[test]
+    fn test_merge_index_lines_keeps_unparseable_lines() {
+        // A malformed NDJSON line (not JSON, no `vers`) is preserved
+        // verbatim so we don't silently drop upstream data.
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let upstream = b"not-json\n{\"name\":\"foo\",\"vers\":\"0.1.0\"}";
+        merge_index_lines(upstream, &mut aggregated, &mut seen);
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(aggregated[0], "not-json");
+    }
+
+    #[test]
+    fn test_merge_index_lines_handles_invalid_utf8() {
+        // A non-UTF-8 body is a no-op rather than a panic.
+        let mut aggregated: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let bytes: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x80];
+        merge_index_lines(&bytes, &mut aggregated, &mut seen);
+        assert!(aggregated.is_empty());
+        assert!(seen.is_empty());
     }
 
     // -----------------------------------------------------------------------

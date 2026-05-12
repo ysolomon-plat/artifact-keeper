@@ -1346,21 +1346,70 @@ pub async fn list_artifacts(
         .get_download_stats_batch(&artifact_ids)
         .await?;
 
+    // For Maven/Gradle, also load the metadata.files arrays so we can
+    // surface POM, sources, javadoc, and other secondary files that the
+    // upload handler groups under one artifact row (#1092). Without this
+    // expansion the listing only sees the primary JAR/WAR and any
+    // secondary files appear "hidden" until a downstream remote proxy
+    // pulls them, at which point the proxy records them as their own
+    // artifact rows.
+    let maven_files_by_artifact: std::collections::HashMap<Uuid, Vec<serde_json::Value>> =
+        if is_maven_format {
+            load_maven_secondary_files(&state.db, &artifact_ids).await
+        } else {
+            std::collections::HashMap::new()
+        };
+
     let mut items = Vec::new();
     for artifact in artifacts {
+        let artifact_id = artifact.id;
         items.push(ArtifactResponse {
-            id: artifact.id,
+            id: artifact_id,
             repository_key: key.clone(),
-            path: artifact.path,
-            name: artifact.name,
-            version: artifact.version,
+            path: artifact.path.clone(),
+            name: artifact.name.clone(),
+            version: artifact.version.clone(),
             size_bytes: artifact.size_bytes,
-            checksum_sha256: artifact.checksum_sha256,
-            content_type: artifact.content_type,
-            download_count: *download_counts.get(&artifact.id).unwrap_or(&0),
+            checksum_sha256: artifact.checksum_sha256.clone(),
+            content_type: artifact.content_type.clone(),
+            download_count: *download_counts.get(&artifact_id).unwrap_or(&0),
             created_at: artifact.created_at,
             metadata: None,
         });
+
+        if let Some(secondary) = maven_files_by_artifact.get(&artifact_id) {
+            for f in secondary {
+                let Some(fpath) = f.get("path").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if fpath == artifact.path {
+                    // Skip the primary's own entry if it ever made it
+                    // into the files array (defensive against an older
+                    // upload path that double-recorded the primary).
+                    continue;
+                }
+                let size = f.get("sizeBytes").and_then(|v| v.as_i64()).unwrap_or(0);
+                let sha = f
+                    .get("sha256")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let ext = f.get("extension").and_then(|v| v.as_str()).unwrap_or("");
+                items.push(ArtifactResponse {
+                    id: artifact_id,
+                    repository_key: key.clone(),
+                    path: fpath.to_string(),
+                    name: artifact.name.clone(),
+                    version: artifact.version.clone(),
+                    size_bytes: size,
+                    checksum_sha256: sha,
+                    content_type: content_type_for_maven_extension(ext).to_string(),
+                    download_count: 0,
+                    created_at: artifact.created_at,
+                    metadata: None,
+                });
+            }
+        }
     }
 
     Ok(Json(ArtifactListResponse {
@@ -1373,6 +1422,64 @@ pub async fn list_artifacts(
         },
         components: None,
     }))
+}
+
+/// Return a best-guess HTTP content type for a Maven file extension.
+/// Mirrors `api::handlers::maven::content_type_for_path` for the
+/// extensions secondary-file rows actually carry. Unknown extensions
+/// fall through to `application/octet-stream`.
+fn content_type_for_maven_extension(ext: &str) -> &'static str {
+    match ext {
+        "pom" | "xml" => "text/xml",
+        "jar" | "war" | "ear" | "aar" | "bundle" => "application/java-archive",
+        "zip" | "tar.gz" => "application/zip",
+        "asc" | "sig" => "application/pgp-signature",
+        "md5" | "sha1" | "sha256" | "sha512" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Load the `metadata.files` JSON array for a batch of Maven artifact ids,
+/// returning a map keyed by `artifact_id`. Used to expand grouped
+/// secondary-file entries into addressable rows in the listing API
+/// (#1092). Artifacts without a metadata row or without a `files` array
+/// are omitted from the returned map.
+async fn load_maven_secondary_files(
+    db: &sqlx::PgPool,
+    artifact_ids: &[Uuid],
+) -> std::collections::HashMap<Uuid, Vec<serde_json::Value>> {
+    use sqlx::Row;
+    if artifact_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let rows = sqlx::query(
+        "SELECT artifact_id, metadata FROM artifact_metadata \
+         WHERE artifact_id = ANY($1) AND format = 'maven'",
+    )
+    .bind(artifact_ids)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let mut out: std::collections::HashMap<Uuid, Vec<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for r in rows {
+        let id: Uuid = match r.try_get("artifact_id") {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let meta: Option<serde_json::Value> = r.try_get("metadata").ok();
+        let files = meta
+            .as_ref()
+            .and_then(|m| m.get("files"))
+            .and_then(|f| f.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if !files.is_empty() {
+            out.insert(id, files);
+        }
+    }
+    out
 }
 
 /// Build a grouped-by-component response for Maven/Gradle repositories.
@@ -2967,6 +3074,63 @@ fn format_repo_type(repo_type: &RepositoryType) -> String {
 mod tests {
     use super::*;
     use crate::error::AppError;
+
+    // -----------------------------------------------------------------------
+    // content_type_for_maven_extension (Maven secondary-file listing, #1092)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_content_type_for_maven_extension_pom() {
+        assert_eq!(content_type_for_maven_extension("pom"), "text/xml");
+    }
+
+    #[test]
+    fn test_content_type_for_maven_extension_jar() {
+        assert_eq!(
+            content_type_for_maven_extension("jar"),
+            "application/java-archive"
+        );
+        assert_eq!(
+            content_type_for_maven_extension("war"),
+            "application/java-archive"
+        );
+        assert_eq!(
+            content_type_for_maven_extension("aar"),
+            "application/java-archive"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_maven_extension_unknown_falls_back() {
+        assert_eq!(
+            content_type_for_maven_extension("xyz"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            content_type_for_maven_extension(""),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn test_content_type_for_maven_extension_checksum_files() {
+        assert_eq!(content_type_for_maven_extension("md5"), "text/plain");
+        assert_eq!(content_type_for_maven_extension("sha1"), "text/plain");
+        assert_eq!(content_type_for_maven_extension("sha256"), "text/plain");
+        assert_eq!(content_type_for_maven_extension("sha512"), "text/plain");
+    }
+
+    #[test]
+    fn test_content_type_for_maven_extension_signatures() {
+        assert_eq!(
+            content_type_for_maven_extension("asc"),
+            "application/pgp-signature"
+        );
+        assert_eq!(
+            content_type_for_maven_extension("sig"),
+            "application/pgp-signature"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Extracted pure functions for testability

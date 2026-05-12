@@ -108,8 +108,46 @@ async fn package_info(
             }
         }
 
-        // Virtual: iterate members in priority order, proxy from first remote that has it.
+        // Virtual: check every member's `artifacts` table (local or remote
+        // cache) before falling back to remote upstream proxy. The previous
+        // implementation called `resolve_virtual_metadata` directly, which
+        // only iterates Remote members and never sees packages published
+        // to a local/staging member (#973).
+        //
+        // Pass order:
+        //   1. All non-Remote members' DBs (locally-hosted packages win).
+        //   2. All Remote members' DBs (already-cached pull-through hits).
+        //   3. Remote upstream proxy for any remaining members.
+        // This ordering blocks an upstream from shadowing a locally
+        // published name. Local-first lookup also avoids an unnecessary
+        // network round-trip when the package is already known to a member.
         if repo.repo_type == RepositoryType::Virtual {
+            let members = proxy_helpers::fetch_virtual_members(&state.db, repo.id).await?;
+
+            // Pass 1+2: any member that already has artifact rows for this name.
+            // Non-Remote members run first so they shadow Remote upstreams; this
+            // matches the supply-chain-attack guard documented on PR #974.
+            let mut ordered_members: Vec<&Repository> = Vec::with_capacity(members.len());
+            ordered_members.extend(
+                members
+                    .iter()
+                    .filter(|m| m.repo_type != RepositoryType::Remote),
+            );
+            ordered_members.extend(
+                members
+                    .iter()
+                    .filter(|m| m.repo_type == RepositoryType::Remote),
+            );
+
+            for member in ordered_members {
+                if let Some(resp) =
+                    fetch_package_info_from_member(&state, member, &repo_key, &name).await?
+                {
+                    return Ok(resp);
+                }
+            }
+
+            // Pass 3: fall through to remote proxy for un-cached packages.
             let upstream_path = format!("packages/{}", name);
             return proxy_helpers::resolve_virtual_metadata(
                 &state.db,
@@ -512,16 +550,99 @@ async fn list_versions(
 // Virtual repo merging helpers
 // ---------------------------------------------------------------------------
 
-/// Query distinct package names from all local (non-remote) virtual members.
+/// Build a `/hex/<repo>/packages/<name>` JSON response from artifact rows
+/// in a single member repo. Returns `Ok(None)` if the member has no
+/// artifacts for `name`, so the caller can advance to the next member.
+///
+/// Tarball URLs are emitted against the *virtual* repo key (not the member
+/// key) so subsequent `mix deps.get` fetches stay routed through the same
+/// virtual endpoint the client originally asked for.
+async fn fetch_package_info_from_member(
+    state: &SharedState,
+    member: &Repository,
+    virtual_repo_key: &str,
+    name: &str,
+) -> Result<Option<Response>, Response> {
+    use sqlx::Row;
+
+    // Uses runtime `sqlx::query` (not `query!`) so we avoid adding a
+    // `.sqlx/` offline cache entry for the lowercased-name lookup.
+    let rows = sqlx::query(
+        "SELECT a.id, a.version, a.checksum_sha256 \
+         FROM artifacts a \
+         WHERE a.repository_id = $1 \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+         ORDER BY a.created_at DESC",
+    )
+    .bind(member.id)
+    .bind(name)
+    .fetch_all(&state.db)
+    .await
+    .map_err(super::db_err)?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let artifact_ids: Vec<uuid::Uuid> = rows
+        .iter()
+        .filter_map(|r| r.try_get::<uuid::Uuid, _>("id").ok())
+        .collect();
+
+    let releases: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let version: Option<String> = r.try_get("version").ok();
+            let version = version.unwrap_or_default();
+            let checksum: String = r.try_get("checksum_sha256").unwrap_or_default();
+            let tarball_url = format!(
+                "/hex/{}/tarballs/{}-{}.tar",
+                virtual_repo_key, name, version
+            );
+            serde_json::json!({
+                "version": version,
+                "url": tarball_url,
+                "checksum": checksum,
+            })
+        })
+        .collect();
+
+    let download_count: i64 = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM download_statistics WHERE artifact_id = ANY($1)",
+        &artifact_ids
+    )
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    let json = serde_json::json!({
+        "name": name,
+        "releases": releases,
+        "downloads": download_count,
+    });
+
+    Ok(Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&json).unwrap()))
+            .unwrap(),
+    ))
+}
+
+/// Query distinct package names from every virtual member's artifacts table.
+///
+/// Includes Remote members because cached pull-through packages are recorded
+/// as `artifacts` rows by `ProxyService`, and a virtual repo's `/names`
+/// index must surface those alongside locally hosted ones (#973).
 async fn query_local_member_names(
     db: &PgPool,
     members: &[Repository],
 ) -> Result<Vec<String>, Response> {
     let mut all_names = Vec::new();
     for member in members {
-        if member.repo_type == RepositoryType::Remote {
-            continue;
-        }
         let names = sqlx::query_scalar!(
             r#"
         SELECT DISTINCT name
@@ -546,8 +667,11 @@ async fn query_local_member_names(
     Ok(all_names)
 }
 
-/// Query name/version pairs from all local (non-remote) virtual members,
+/// Query name/version pairs from every virtual member's artifacts table,
 /// grouped by package name.
+///
+/// Includes Remote members because their proxy cache populates `artifacts`
+/// rows on pull-through (#973).
 async fn query_local_member_versions(
     db: &PgPool,
     members: &[Repository],
@@ -555,9 +679,6 @@ async fn query_local_member_versions(
     let mut packages: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for member in members {
-        if member.repo_type == RepositoryType::Remote {
-            continue;
-        }
         let artifacts = sqlx::query!(
             r#"
         SELECT name, version
