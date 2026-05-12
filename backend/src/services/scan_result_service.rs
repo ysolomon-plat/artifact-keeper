@@ -9,6 +9,7 @@ use crate::error::{AppError, Result};
 use crate::models::security::{
     DashboardSummary, Grade, RawFinding, RepoSecurityScore, ScanFinding, ScanResult, Severity,
 };
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (no DB, testable in isolation)
@@ -297,6 +298,12 @@ impl ScanResultService {
     /// state (`completed`, `failed`) are not touched, so this is safe to run
     /// concurrently with an in-flight scan that completes mid-tick.
     ///
+    /// Emits one `SCAN_REAPED` audit-log entry per reaped row (#1063) so a
+    /// running -> failed transition is visible to operators investigating an
+    /// incident. Audit-log writes are best-effort: a failure to record the
+    /// event is logged at warn level but does not roll back the reap, since
+    /// leaving the row wedged in `running` is the worse outcome.
+    ///
     /// Returns the count of rows reaped.
     pub async fn cleanup_stuck_scans(&self, stuck_threshold: Duration) -> Result<u64> {
         // Cap at i64::MAX seconds so the cast is well-defined for any sane
@@ -307,7 +314,7 @@ impl ScanResultService {
             secs
         );
 
-        let result = sqlx::query!(
+        let reaped = sqlx::query!(
             r#"
             UPDATE scan_results
             SET status = 'failed',
@@ -316,15 +323,44 @@ impl ScanResultService {
             WHERE status = 'running'
               AND started_at IS NOT NULL
               AND started_at < NOW() - make_interval(secs => $2::double precision)
+            RETURNING id, artifact_id, repository_id, started_at, completed_at
             "#,
             error_message,
             secs as f64,
         )
-        .execute(&self.db)
+        .fetch_all(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        Ok(result.rows_affected())
+        // Per-row audit emission (#1063). A scan transitioning running -> failed
+        // without operator action is security-relevant: an in-flight vulnerability
+        // scan never completed, so the artifact may have undisclosed CVEs.
+        // Operators looking at the audit log to investigate an incident need to
+        // see this transition rather than only the prometheus counter.
+        let audit = AuditService::new(self.db.clone());
+        for row in &reaped {
+            let details = serde_json::json!({
+                "scan_id": row.id,
+                "artifact_id": row.artifact_id,
+                "repository_id": row.repository_id,
+                "started_at": row.started_at,
+                "reaped_at": row.completed_at,
+                "threshold_secs": secs,
+                "reason": "stuck_running_janitor",
+            });
+            let entry = AuditEntry::new(AuditAction::ScanReaped, ResourceType::ScanResult)
+                .resource(row.id)
+                .details(details);
+            if let Err(e) = audit.log(entry).await {
+                tracing::warn!(
+                    scan_id = %row.id,
+                    error = %e,
+                    "stuck-scan janitor: failed to write audit log entry for reaped scan",
+                );
+            }
+        }
+
+        Ok(reaped.len() as u64)
     }
 
     /// Get a scan result by ID.

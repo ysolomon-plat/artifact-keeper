@@ -116,6 +116,18 @@ async fn cleanup(pool: &PgPool, repo_id: Uuid) {
         .bind(repo_id)
         .execute(pool)
         .await;
+    // Audit entries reference scan_results via resource_id but do not have a
+    // FK, so we clean them up explicitly to keep test runs idempotent.
+    let _ = sqlx::query(
+        r#"
+        DELETE FROM audit_log
+        WHERE action = 'SCAN_REAPED'
+          AND resource_id IN (SELECT id FROM scan_results WHERE repository_id = $1)
+        "#,
+    )
+    .bind(repo_id)
+    .execute(pool)
+    .await;
     let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
         .bind(repo_id)
         .execute(pool)
@@ -293,6 +305,138 @@ async fn test_cleanup_stuck_scans_returns_count_of_reaped_rows() {
     assert_eq!(
         cleaned, 3u64,
         "janitor should report exactly the rows it reaped"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+// =============================================================================
+// Audit emission (#1063): reaping a stuck scan writes one SCAN_REAPED audit_log
+// entry per row, populated with scan_id / artifact_id / repository_id /
+// started_at / reaped_at so operators investigating an incident can see which
+// vulnerability scans never completed.
+// =============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_cleanup_stuck_scans_emits_audit_event_per_reaped_row() {
+    let pool = connect_db().await;
+    let repo_id = create_test_repo(&pool).await;
+    let artifact_id = create_test_artifact(&pool, repo_id).await;
+    let svc = ScanResultService::new(pool.clone());
+
+    let stuck_started = chrono::Utc::now() - chrono::Duration::minutes(45);
+    let stuck_id = insert_running_scan(&pool, artifact_id, repo_id, stuck_started).await;
+    let fresh_started = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let _ = insert_running_scan(&pool, artifact_id, repo_id, fresh_started).await;
+
+    let cleaned = svc
+        .cleanup_stuck_scans(Duration::from_secs(30 * 60))
+        .await
+        .expect("janitor should succeed");
+    assert_eq!(cleaned, 1u64, "exactly one stuck row should be reaped");
+
+    // Exactly one SCAN_REAPED audit entry for this scan, with full context.
+    let row: (String, String, Option<Uuid>, Option<serde_json::Value>) = sqlx::query_as(
+        r#"
+        SELECT action, resource_type, resource_id, details
+        FROM audit_log
+        WHERE action = 'SCAN_REAPED'
+          AND resource_id = $1
+        "#,
+    )
+    .bind(stuck_id)
+    .fetch_one(&pool)
+    .await
+    .expect("audit_log should have one SCAN_REAPED entry for the reaped scan");
+
+    assert_eq!(row.0, "SCAN_REAPED");
+    assert_eq!(row.1, "scan_result");
+    assert_eq!(row.2, Some(stuck_id));
+    let details = row.3.expect("audit entry should carry details");
+    assert_eq!(
+        details.get("scan_id").and_then(|v| v.as_str()),
+        Some(stuck_id.to_string().as_str()),
+        "details.scan_id must match the reaped row id"
+    );
+    assert_eq!(
+        details.get("artifact_id").and_then(|v| v.as_str()),
+        Some(artifact_id.to_string().as_str())
+    );
+    assert_eq!(
+        details.get("repository_id").and_then(|v| v.as_str()),
+        Some(repo_id.to_string().as_str())
+    );
+    assert!(
+        details.get("started_at").is_some(),
+        "details.started_at must be populated"
+    );
+    assert!(
+        details.get("reaped_at").is_some(),
+        "details.reaped_at must be populated"
+    );
+    assert_eq!(
+        details.get("reason").and_then(|v| v.as_str()),
+        Some("stuck_running_janitor")
+    );
+
+    // Sweep across all rows: exactly one SCAN_REAPED event was written for this
+    // repository's scans (the fresh row must NOT have produced an audit entry).
+    let total: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_log
+        WHERE action = 'SCAN_REAPED'
+          AND resource_id IN (SELECT id FROM scan_results WHERE repository_id = $1)
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit entries");
+    assert_eq!(
+        total.0, 1,
+        "exactly one SCAN_REAPED audit event should exist for the repository"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_cleanup_stuck_scans_emits_one_audit_event_per_row_batch() {
+    let pool = connect_db().await;
+    let repo_id = create_test_repo(&pool).await;
+    let artifact_id = create_test_artifact(&pool, repo_id).await;
+    let svc = ScanResultService::new(pool.clone());
+
+    // Five stuck rows: every one should generate its own SCAN_REAPED entry.
+    let stuck_started = chrono::Utc::now() - chrono::Duration::hours(2);
+    for _ in 0..5 {
+        let _ = insert_running_scan(&pool, artifact_id, repo_id, stuck_started).await;
+    }
+
+    let cleaned = svc
+        .cleanup_stuck_scans(Duration::from_secs(30 * 60))
+        .await
+        .expect("janitor should succeed");
+    assert_eq!(cleaned, 5u64);
+
+    let total: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_log
+        WHERE action = 'SCAN_REAPED'
+          AND resource_id IN (SELECT id FROM scan_results WHERE repository_id = $1)
+        "#,
+    )
+    .bind(repo_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count audit entries");
+    assert_eq!(
+        total.0, 5,
+        "one SCAN_REAPED audit event per reaped scan_results row"
     );
 
     cleanup(&pool, repo_id).await;

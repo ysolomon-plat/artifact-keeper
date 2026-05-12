@@ -59,6 +59,9 @@ pub enum AuditAction {
     PluginUninstalled,
     PluginEnabled,
     PluginDisabled,
+
+    // Scanning / janitors
+    ScanReaped,
 }
 
 impl AuditAction {
@@ -99,6 +102,7 @@ impl AuditAction {
             AuditAction::PluginUninstalled => "PLUGIN_UNINSTALLED",
             AuditAction::PluginEnabled => "PLUGIN_ENABLED",
             AuditAction::PluginDisabled => "PLUGIN_DISABLED",
+            AuditAction::ScanReaped => "SCAN_REAPED",
         }
     }
 }
@@ -115,6 +119,7 @@ pub enum ResourceType {
     Backup,
     Setting,
     Plugin,
+    ScanResult,
 }
 
 impl ResourceType {
@@ -129,6 +134,7 @@ impl ResourceType {
             ResourceType::Backup => "backup",
             ResourceType::Setting => "setting",
             ResourceType::Plugin => "plugin",
+            ResourceType::ScanResult => "scan_result",
         }
     }
 }
@@ -476,6 +482,11 @@ mod tests {
         assert_eq!(AuditAction::PluginDisabled.as_str(), "PLUGIN_DISABLED");
     }
 
+    #[test]
+    fn test_audit_action_as_str_scanning() {
+        assert_eq!(AuditAction::ScanReaped.as_str(), "SCAN_REAPED");
+    }
+
     // -----------------------------------------------------------------------
     // ResourceType::as_str
     // -----------------------------------------------------------------------
@@ -491,6 +502,7 @@ mod tests {
         assert_eq!(ResourceType::Backup.as_str(), "backup");
         assert_eq!(ResourceType::Setting.as_str(), "setting");
         assert_eq!(ResourceType::Plugin.as_str(), "plugin");
+        assert_eq!(ResourceType::ScanResult.as_str(), "scan_result");
     }
 
     // -----------------------------------------------------------------------
