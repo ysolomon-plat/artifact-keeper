@@ -25,13 +25,38 @@ use crate::services::scheduler_service::normalize_cron_expression;
 /// `DELETE /v2/<image>/manifests/<reference>` would do. `$1::UUID` is the
 /// repo filter: a repo-scoped policy passes the repo id, a global policy
 /// passes NULL.
+///
+/// The join condition matches on `artifacts.path` rather than parsing
+/// `artifacts.name` with a regex. The OCI handler writes
+/// `path = 'v2/{image}/manifests/{reference}'` (see
+/// `backend/src/api/handlers/oci_v2.rs` `put_manifest`), so reconstructing
+/// the path from `oci_tags.(name, tag)` is exact and survives the awkward
+/// edge cases the previous regex didn't:
+///
+/// - **port-in-name** (`host:5000/img:tag`): the regex
+///   `'^(.+):[^:]+$'` greedily stripped the last `:segment`, so a
+///   port-bearing image still matched, but only by accident — any
+///   normalization difference between the two columns broke the join.
+/// - **digest reference** (`reference = "sha256:abc..."`):
+///   `artifacts.name = "img:sha256:abc..."`. Greedy match on the regex
+///   extracted `"img:sha256"`, NOT `"img"`, so the join failed entirely
+///   for any manifest pinned by digest.
+///
+/// `artifacts.storage_key` is still asserted to equal
+/// `'oci-manifests/' || ot.manifest_digest` as a defence-in-depth
+/// constraint. Note: this couples the cascade to the
+/// `manifest_storage_key()` invariant in `oci_v2.rs:414`. If anyone ever
+/// changes that prefix the cascade silently no-ops; #1413 tracks
+/// extracting a shared constant. The path-based predicate is the primary
+/// join key, the storage_key predicate is a secondary integrity check
+/// that protects against artifact-name/path drift.
 const CASCADE_OCI_TAGS_SQL: &str = r#"
 DELETE FROM oci_tags ot
 USING artifacts a
 WHERE a.is_deleted = true
   AND a.repository_id = ot.repository_id
   AND a.storage_key = 'oci-manifests/' || ot.manifest_digest
-  AND substring(a.name from '^(.+):[^:]+$') = ot.name
+  AND a.path = 'v2/' || ot.name || '/manifests/' || ot.tag
   AND a.version = ot.tag
   AND ($1::UUID IS NULL OR a.repository_id = $1)
 "#;
@@ -281,6 +306,14 @@ impl LifecycleService {
     }
 
     /// Execute a policy (dry_run=true previews without deleting).
+    ///
+    /// For real runs the soft-delete, oci_tags cascade and `last_run_at`
+    /// bookkeeping all happen inside a single Postgres transaction. Without
+    /// this, a crash (or any DB error) between the per-type execute and the
+    /// cascade leaves the system in the exact broken state the cascade was
+    /// added to fix: artifacts soft-deleted but `oci_tags` still pointing at
+    /// the manifest, so the storage GC orphan predicate (#1144) treats the
+    /// manifest as live and never reclaims it.
     pub async fn execute_policy(&self, id: Uuid, dry_run: bool) -> Result<PolicyExecutionResult> {
         let policy = self.get_policy(id).await?;
 
@@ -290,42 +323,70 @@ impl LifecycleService {
             ));
         }
 
-        let result = match policy.policy_type.as_str() {
-            "max_age_days" => self.execute_max_age(&policy, dry_run).await?,
-            "max_versions" => self.execute_max_versions(&policy, dry_run).await?,
-            "no_downloads_days" => self.execute_no_downloads(&policy, dry_run).await?,
-            "tag_pattern_keep" => self.execute_tag_pattern_keep(&policy, dry_run).await?,
-            "tag_pattern_delete" => self.execute_tag_pattern_delete(&policy, dry_run).await?,
-            "size_quota_bytes" => self.execute_size_quota(&policy, dry_run).await?,
-            _ => {
-                return Err(AppError::Internal(format!(
-                    "Unsupported policy type: {}",
-                    policy.policy_type
-                )));
-            }
-        };
+        // Dry-run reads only. Take a regular connection, skip the
+        // transaction overhead (and skip the cascade entirely — dry_run
+        // must not mutate oci_tags).
+        if dry_run {
+            let mut conn = self
+                .db
+                .acquire()
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            return Self::dispatch_execute(&mut conn, &policy, true).await;
+        }
+
+        // Real run: soft-delete + cascade + last_run_at as one unit.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let result = Self::dispatch_execute(&mut tx, &policy, false).await?;
 
         // Bring oci_tags in line with the freshly soft-deleted manifest
         // artifacts before recording last_run. Without this, storage GC sees
         // a live oci_tags row pointing at the manifest's storage_key and
         // never reclaims it, so the manifest JSON (and, transitively, every
         // blob layer reachable only through it) stays in S3 forever.
-        self.cascade_oci_tags_cleanup(policy.repository_id, dry_run)
-            .await?;
+        Self::cascade_oci_tags_cleanup_tx(&mut tx, policy.repository_id).await?;
 
-        // Update last_run stats
-        if !dry_run {
-            sqlx::query(
-                "UPDATE lifecycle_policies SET last_run_at = NOW(), last_run_items_removed = $2 WHERE id = $1",
-            )
-            .bind(id)
-            .bind(result.artifacts_removed)
-            .execute(&self.db)
+        sqlx::query(
+            "UPDATE lifecycle_policies SET last_run_at = NOW(), last_run_items_removed = $2 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(result.artifacts_removed)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-        }
 
         Ok(result)
+    }
+
+    /// Dispatch to the per-type implementation against a single
+    /// `PgConnection`. Real runs pass `&mut *tx` (a transaction
+    /// re-borrowed as a connection) so the per-type soft-delete and the
+    /// cascade share one transactional scope.
+    async fn dispatch_execute(
+        conn: &mut sqlx::PgConnection,
+        policy: &LifecyclePolicy,
+        dry_run: bool,
+    ) -> Result<PolicyExecutionResult> {
+        match policy.policy_type.as_str() {
+            "max_age_days" => Self::execute_max_age(conn, policy, dry_run).await,
+            "max_versions" => Self::execute_max_versions(conn, policy, dry_run).await,
+            "no_downloads_days" => Self::execute_no_downloads(conn, policy, dry_run).await,
+            "tag_pattern_keep" => Self::execute_tag_pattern_keep(conn, policy, dry_run).await,
+            "tag_pattern_delete" => Self::execute_tag_pattern_delete(conn, policy, dry_run).await,
+            "size_quota_bytes" => Self::execute_size_quota(conn, policy, dry_run).await,
+            other => Err(AppError::Internal(format!(
+                "Unsupported policy type: {other}",
+            ))),
+        }
     }
 
     /// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
@@ -340,19 +401,18 @@ impl LifecycleService {
     /// that repo; a global policy (`repository_id IS NULL`) cleans across
     /// every repo. Idempotent on re-runs.
     ///
-    /// `dry_run` short-circuits so observation-only policy runs leave no
-    /// side effects (would otherwise drop tags from prior real runs).
-    async fn cascade_oci_tags_cleanup(
-        &self,
+    /// Runs against the caller's connection. In `execute_policy` the caller
+    /// re-borrows a transaction (`&mut *tx`) so the soft-delete and the
+    /// cascade commit atomically. A crash between the two (which used to be
+    /// two separate pool round-trips) would leave the manifest soft-deleted
+    /// but the tag row alive, which is exactly the bug this PR fixes.
+    async fn cascade_oci_tags_cleanup_tx(
+        conn: &mut sqlx::PgConnection,
         repository_id: Option<Uuid>,
-        dry_run: bool,
     ) -> Result<u64> {
-        if dry_run {
-            return Ok(0);
-        }
         let removed = sqlx::query(CASCADE_OCI_TAGS_SQL)
             .bind(repository_id)
-            .execute(&self.db)
+            .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
             .rows_affected();
@@ -530,7 +590,7 @@ impl LifecycleService {
     }
 
     async fn execute_max_age(
-        &self,
+        conn: &mut sqlx::PgConnection,
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
@@ -554,7 +614,7 @@ impl LifecycleService {
             )
             .bind(policy.repository_id)
             .bind(days as i32)
-            .fetch_one(&self.db)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
         } else {
@@ -567,7 +627,7 @@ impl LifecycleService {
                 "#,
             )
             .bind(days as i32)
-            .fetch_one(&self.db)
+            .fetch_one(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?
         };
@@ -585,7 +645,7 @@ impl LifecycleService {
                 )
                 .bind(policy.repository_id)
                 .bind(days as i32)
-                .execute(&self.db)
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?
             } else {
@@ -597,7 +657,7 @@ impl LifecycleService {
                     "#,
                 )
                 .bind(days as i32)
-                .execute(&self.db)
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?
             };
@@ -614,7 +674,7 @@ impl LifecycleService {
     }
 
     async fn execute_max_versions(
-        &self,
+        conn: &mut sqlx::PgConnection,
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
@@ -649,7 +709,7 @@ impl LifecycleService {
         )
         .bind(repo_id)
         .bind(keep)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -672,7 +732,7 @@ impl LifecycleService {
             )
             .bind(repo_id)
             .bind(keep)
-            .execute(&self.db)
+            .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
             removed = result.rows_affected() as i64;
@@ -688,7 +748,7 @@ impl LifecycleService {
     }
 
     async fn execute_no_downloads(
-        &self,
+        conn: &mut sqlx::PgConnection,
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
@@ -718,7 +778,7 @@ impl LifecycleService {
         )
         .bind(repo_filter)
         .bind(days as i32)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -739,7 +799,7 @@ impl LifecycleService {
             )
             .bind(repo_filter)
             .bind(days as i32)
-            .execute(&self.db)
+            .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
             removed = result.rows_affected() as i64;
@@ -755,7 +815,7 @@ impl LifecycleService {
     }
 
     async fn execute_tag_pattern_keep(
-        &self,
+        conn: &mut sqlx::PgConnection,
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
@@ -781,7 +841,7 @@ impl LifecycleService {
         )
         .bind(repo_filter)
         .bind(pattern)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -797,7 +857,7 @@ impl LifecycleService {
             )
             .bind(repo_filter)
             .bind(pattern)
-            .execute(&self.db)
+            .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
             removed = result.rows_affected() as i64;
@@ -813,7 +873,7 @@ impl LifecycleService {
     }
 
     async fn execute_tag_pattern_delete(
-        &self,
+        conn: &mut sqlx::PgConnection,
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
@@ -838,7 +898,7 @@ impl LifecycleService {
         )
         .bind(repo_filter)
         .bind(pattern)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -854,7 +914,7 @@ impl LifecycleService {
             )
             .bind(repo_filter)
             .bind(pattern)
-            .execute(&self.db)
+            .execute(&mut *conn)
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
             removed = result.rows_affected() as i64;
@@ -870,7 +930,7 @@ impl LifecycleService {
     }
 
     async fn execute_size_quota(
-        &self,
+        conn: &mut sqlx::PgConnection,
         policy: &LifecyclePolicy,
         dry_run: bool,
     ) -> Result<PolicyExecutionResult> {
@@ -897,7 +957,7 @@ impl LifecycleService {
             "#,
         )
         .bind(repo_id)
-        .fetch_one(&self.db)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -924,7 +984,7 @@ impl LifecycleService {
             "#,
         )
         .bind(repo_id)
-        .fetch_all(&self.db)
+        .fetch_all(&mut *conn)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -944,7 +1004,7 @@ impl LifecycleService {
         if !dry_run && !to_remove.is_empty() {
             let result = sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = ANY($1)")
                 .bind(&to_remove)
-                .execute(&self.db)
+                .execute(&mut *conn)
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
             removed = result.rows_affected() as i64;
@@ -2290,46 +2350,66 @@ mod tests {
         assert!(CASCADE_OCI_TAGS_SQL.contains("a.is_deleted = true"));
         assert!(CASCADE_OCI_TAGS_SQL.contains("a.repository_id = ot.repository_id"));
         assert!(CASCADE_OCI_TAGS_SQL.contains("'oci-manifests/' || ot.manifest_digest"));
-        assert!(CASCADE_OCI_TAGS_SQL.contains("substring(a.name from '^(.+):[^:]+$') = ot.name"));
+        // Path-based join replaces the previous substring-regex on
+        // `artifacts.name`. The regex broke for digest references
+        // (`img:sha256:abc`) and was fragile around port-in-name.
+        assert!(
+            CASCADE_OCI_TAGS_SQL.contains("a.path = 'v2/' || ot.name || '/manifests/' || ot.tag")
+        );
+        assert!(
+            !CASCADE_OCI_TAGS_SQL.contains("substring(a.name"),
+            "regex on artifacts.name was replaced by a path-based join"
+        );
         assert!(CASCADE_OCI_TAGS_SQL.contains("a.version = ot.tag"));
         assert!(CASCADE_OCI_TAGS_SQL.contains("$1::UUID IS NULL OR a.repository_id = $1"));
     }
 
-    #[tokio::test]
-    async fn test_cascade_oci_tags_cleanup_dry_run_returns_zero_without_hitting_db() {
-        // A lazy pool with no real database behind it; dry_run must short-
-        // circuit before any SQL is executed.
-        let svc = make_service_for_validation();
-        let result = svc.cascade_oci_tags_cleanup(None, true).await;
-        assert!(matches!(result, Ok(0)), "dry_run must not execute SQL");
-    }
+    // The cascade now runs inside the execute_policy transaction (no
+    // standalone entry point with a `dry_run` flag). These tests cover
+    // the surface the unit suite can reach without Postgres: SQL shape +
+    // path-reconstruction predicate. Behavioural coverage lives in
+    // backend/tests/lifecycle_policy_tests.rs against a real database,
+    // including the port-in-name and digest-as-reference regression
+    // cases from PR #1406 review.
 
-    #[tokio::test]
-    async fn test_cascade_oci_tags_cleanup_dry_run_ignores_repo_filter() {
-        // Same as above but with a repo-scoped policy: dry_run still
-        // short-circuits.
-        let svc = make_service_for_validation();
-        let result = svc
-            .cascade_oci_tags_cleanup(Some(Uuid::new_v4()), true)
-            .await;
-        assert!(matches!(result, Ok(0)));
-    }
+    #[test]
+    fn test_cascade_sql_path_reconstruction_handles_port_in_name() {
+        // Pure-Rust mirror of the SQL predicate. If this drifts from the
+        // SQL the integration test in backend/tests/lifecycle_policy_tests.rs
+        // (`test_cascade_handles_port_in_image_name`) will catch it. We
+        // assert the rebuilt path matches `artifacts.path` for the
+        // pathological inputs the old `substring(...)` regex failed on.
+        fn rebuild_path(image: &str, tag: &str) -> String {
+            format!("v2/{image}/manifests/{tag}")
+        }
+        fn artifact_path(image: &str, reference: &str) -> String {
+            // mirrors backend/src/api/handlers/oci_v2.rs put_manifest:
+            //   let artifact_path = format!("v2/{}/manifests/{}", image, reference);
+            format!("v2/{image}/manifests/{reference}")
+        }
 
-    #[tokio::test]
-    async fn test_cascade_oci_tags_cleanup_returns_db_error_on_unreachable_db() {
-        // Without dry_run, the SQL must execute and the unreachable pool
-        // surfaces as AppError::Database; this guards the error mapping.
-        let svc = make_service_for_validation();
-        let result = svc.cascade_oci_tags_cleanup(None, false).await;
-        assert!(matches!(result, Err(AppError::Database(_))));
-    }
-
-    #[tokio::test]
-    async fn test_cascade_oci_tags_cleanup_repo_scoped_errors_on_unreachable_db() {
-        let svc = make_service_for_validation();
-        let result = svc
-            .cascade_oci_tags_cleanup(Some(Uuid::new_v4()), false)
-            .await;
-        assert!(matches!(result, Err(AppError::Database(_))));
+        // 1. Simple case.
+        assert_eq!(rebuild_path("myimg", "v1"), artifact_path("myimg", "v1"),);
+        // 2. Nested image namespace.
+        assert_eq!(
+            rebuild_path("org/img", "latest"),
+            artifact_path("org/img", "latest"),
+        );
+        // 3. Port-in-name (concern #1 from PR #1406 review).
+        assert_eq!(
+            rebuild_path("myregistry.example:5000/image", "tag"),
+            artifact_path("myregistry.example:5000/image", "tag"),
+        );
+        // 4. Digest as reference (the regex on `artifacts.name`
+        //    extracted `img:sha256`, not `img`, breaking the join).
+        assert_eq!(
+            rebuild_path("myimg", "sha256:abc123"),
+            artifact_path("myimg", "sha256:abc123"),
+        );
+        // 5. Combined: port-in-name AND digest reference.
+        assert_eq!(
+            rebuild_path("host:5000/img", "sha256:abc123"),
+            artifact_path("host:5000/img", "sha256:abc123"),
+        );
     }
 }
