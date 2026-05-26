@@ -18,6 +18,24 @@ use uuid::Uuid;
 use crate::error::{AppError, Result};
 use crate::services::scheduler_service::normalize_cron_expression;
 
+/// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
+///
+/// Each row in `oci_tags` is matched to its source artifact via the
+/// `(repository_id, manifest_digest, image, tag)` tuple, mirroring what
+/// `DELETE /v2/<image>/manifests/<reference>` would do. `$1::UUID` is the
+/// repo filter: a repo-scoped policy passes the repo id, a global policy
+/// passes NULL.
+const CASCADE_OCI_TAGS_SQL: &str = r#"
+DELETE FROM oci_tags ot
+USING artifacts a
+WHERE a.is_deleted = true
+  AND a.repository_id = ot.repository_id
+  AND a.storage_key = 'oci-manifests/' || ot.manifest_digest
+  AND substring(a.name from '^(.+):[^:]+$') = ot.name
+  AND a.version = ot.tag
+  AND ($1::UUID IS NULL OR a.repository_id = $1)
+"#;
+
 /// A lifecycle policy attached to a repository (or global if repository_id is NULL).
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow, ToSchema)]
 pub struct LifecyclePolicy {
@@ -287,6 +305,14 @@ impl LifecycleService {
             }
         };
 
+        // Bring oci_tags in line with the freshly soft-deleted manifest
+        // artifacts before recording last_run. Without this, storage GC sees
+        // a live oci_tags row pointing at the manifest's storage_key and
+        // never reclaims it, so the manifest JSON (and, transitively, every
+        // blob layer reachable only through it) stays in S3 forever.
+        self.cascade_oci_tags_cleanup(policy.repository_id, dry_run)
+            .await?;
+
         // Update last_run stats
         if !dry_run {
             sqlx::query(
@@ -300,6 +326,43 @@ impl LifecycleService {
         }
 
         Ok(result)
+    }
+
+    /// Delete `oci_tags` rows whose matching manifest artifact is soft-deleted.
+    ///
+    /// Every `execute_*` helper marks artifacts with `is_deleted = true` but
+    /// leaves `oci_tags` untouched, mirroring the original lifecycle handler
+    /// contract. The storage GC orphan predicate (#1144) treats any
+    /// `oci_tags` row as a live reference, so the soft-deleted manifest
+    /// keys are never reclaimed. This cascade closes the gap.
+    ///
+    /// Scope mirrors the policy: a repo-scoped policy cleans tags only in
+    /// that repo; a global policy (`repository_id IS NULL`) cleans across
+    /// every repo. Idempotent on re-runs.
+    ///
+    /// `dry_run` short-circuits so observation-only policy runs leave no
+    /// side effects (would otherwise drop tags from prior real runs).
+    async fn cascade_oci_tags_cleanup(
+        &self,
+        repository_id: Option<Uuid>,
+        dry_run: bool,
+    ) -> Result<u64> {
+        if dry_run {
+            return Ok(0);
+        }
+        let removed = sqlx::query(CASCADE_OCI_TAGS_SQL)
+            .bind(repository_id)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?
+            .rows_affected();
+        if removed > 0 {
+            tracing::info!(
+                "Lifecycle cascade: removed {} stale oci_tags rows for soft-deleted manifests",
+                removed,
+            );
+        }
+        Ok(removed)
     }
 
     /// Execute all enabled policies (called by scheduled background task).
@@ -2210,5 +2273,63 @@ mod tests {
             now,
             cadence
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // cascade_oci_tags_cleanup tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cascade_sql_matches_expected_predicates() {
+        // The SQL has to keep the (repo, manifest_digest, image, tag) join
+        // shape and the repo-scope guard. Drifting any of these would either
+        // delete unrelated tags (no repo filter) or leak rows in other repos
+        // (a global delete unscoped by image:tag).
+        assert!(CASCADE_OCI_TAGS_SQL.contains("DELETE FROM oci_tags ot"));
+        assert!(CASCADE_OCI_TAGS_SQL.contains("USING artifacts a"));
+        assert!(CASCADE_OCI_TAGS_SQL.contains("a.is_deleted = true"));
+        assert!(CASCADE_OCI_TAGS_SQL.contains("a.repository_id = ot.repository_id"));
+        assert!(CASCADE_OCI_TAGS_SQL.contains("'oci-manifests/' || ot.manifest_digest"));
+        assert!(CASCADE_OCI_TAGS_SQL.contains("substring(a.name from '^(.+):[^:]+$') = ot.name"));
+        assert!(CASCADE_OCI_TAGS_SQL.contains("a.version = ot.tag"));
+        assert!(CASCADE_OCI_TAGS_SQL.contains("$1::UUID IS NULL OR a.repository_id = $1"));
+    }
+
+    #[tokio::test]
+    async fn test_cascade_oci_tags_cleanup_dry_run_returns_zero_without_hitting_db() {
+        // A lazy pool with no real database behind it; dry_run must short-
+        // circuit before any SQL is executed.
+        let svc = make_service_for_validation();
+        let result = svc.cascade_oci_tags_cleanup(None, true).await;
+        assert!(matches!(result, Ok(0)), "dry_run must not execute SQL");
+    }
+
+    #[tokio::test]
+    async fn test_cascade_oci_tags_cleanup_dry_run_ignores_repo_filter() {
+        // Same as above but with a repo-scoped policy: dry_run still
+        // short-circuits.
+        let svc = make_service_for_validation();
+        let result = svc
+            .cascade_oci_tags_cleanup(Some(Uuid::new_v4()), true)
+            .await;
+        assert!(matches!(result, Ok(0)));
+    }
+
+    #[tokio::test]
+    async fn test_cascade_oci_tags_cleanup_returns_db_error_on_unreachable_db() {
+        // Without dry_run, the SQL must execute and the unreachable pool
+        // surfaces as AppError::Database; this guards the error mapping.
+        let svc = make_service_for_validation();
+        let result = svc.cascade_oci_tags_cleanup(None, false).await;
+        assert!(matches!(result, Err(AppError::Database(_))));
+    }
+
+    #[tokio::test]
+    async fn test_cascade_oci_tags_cleanup_repo_scoped_errors_on_unreachable_db() {
+        let svc = make_service_for_validation();
+        let result = svc
+            .cascade_oci_tags_cleanup(Some(Uuid::new_v4()), false)
+            .await;
+        assert!(matches!(result, Err(AppError::Database(_))));
     }
 }

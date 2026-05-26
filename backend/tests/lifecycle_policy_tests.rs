@@ -451,6 +451,277 @@ async fn test_size_quota_lru_frequently_downloaded_survives() {
     cleanup_with_downloads(&pool, repo_id).await;
 }
 
+// =============================================================================
+// oci_tags cascade: lifecycle soft-delete must also remove the live tag row,
+// otherwise storage GC (see backend/src/services/storage_gc_service.rs:36) sees
+// the tag as a live reference and never reclaims the manifest in S3.
+// =============================================================================
+
+/// Insert a fake OCI manifest artifact with realistic storage_key shape.
+async fn insert_oci_manifest_artifact(
+    pool: &PgPool,
+    repo_id: Uuid,
+    image: &str,
+    tag: &str,
+    digest: &str,
+    size: i64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let name = format!("{image}:{tag}");
+    let path = format!("v2/{image}/manifests/{tag}");
+    let storage_key = format!("oci-manifests/{digest}");
+    let checksum = format!("{:0>64}", "deadbeef");
+    sqlx::query(
+        r#"
+        INSERT INTO artifacts (id, repository_id, name, version, path, size_bytes,
+                               checksum_sha256, content_type, storage_key, is_deleted)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'application/vnd.oci.image.manifest.v1+json', $8, false)
+        "#,
+    )
+    .bind(id)
+    .bind(repo_id)
+    .bind(&name)
+    .bind(tag)
+    .bind(&path)
+    .bind(size)
+    .bind(&checksum)
+    .bind(&storage_key)
+    .execute(pool)
+    .await
+    .expect("failed to insert oci manifest artifact");
+    id
+}
+
+/// Insert a matching oci_tags row.
+async fn insert_oci_tag(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str, digest: &str) {
+    sqlx::query(
+        r#"
+        INSERT INTO oci_tags (repository_id, name, tag, manifest_digest, manifest_content_type)
+        VALUES ($1, $2, $3, $4, 'application/vnd.oci.image.manifest.v1+json')
+        "#,
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(tag)
+    .bind(digest)
+    .execute(pool)
+    .await
+    .expect("failed to insert oci_tag");
+}
+
+/// Return true if an oci_tags row still exists for the given (repo, image, tag).
+async fn oci_tag_exists(pool: &PgPool, repo_id: Uuid, image: &str, tag: &str) -> bool {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND name = $2 AND tag = $3",
+    )
+    .bind(repo_id)
+    .bind(image)
+    .bind(tag)
+    .fetch_one(pool)
+    .await
+    .expect("oci_tags count failed");
+    row.0 > 0
+}
+
+/// Soft-deleting an OCI manifest via tag_pattern_delete must also remove the
+/// matching oci_tags row, otherwise storage GC's orphan predicate (#1144)
+/// keeps the manifest object alive in S3 forever.
+#[tokio::test]
+#[ignore]
+async fn test_tag_pattern_delete_cascades_oci_tags_for_soft_deleted_manifest() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Two manifests in the same image: one ephemeral (matches the delete
+    // pattern), one a kept release.
+    let ephemeral_digest =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let release_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let ephemeral_id = insert_oci_manifest_artifact(
+        &pool,
+        repo_id,
+        "myimg",
+        "build-snapshot-images",
+        ephemeral_digest,
+        100,
+    )
+    .await;
+    let release_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "myimg", "v1.0.0", release_digest, 200).await;
+    insert_oci_tag(
+        &pool,
+        repo_id,
+        "myimg",
+        "build-snapshot-images",
+        ephemeral_digest,
+    )
+    .await;
+    insert_oci_tag(&pool, repo_id, "myimg", "v1.0.0", release_digest).await;
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Delete snapshot-images".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            config: serde_json::json!({"pattern": "-snapshot-images$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .expect("failed to create policy");
+
+    // Dry run must not touch oci_tags.
+    let _ = svc
+        .execute_policy(policy.id, true)
+        .await
+        .expect("dry run failed");
+    assert!(!is_deleted(&pool, ephemeral_id).await);
+    assert!(
+        oci_tag_exists(&pool, repo_id, "myimg", "build-snapshot-images").await,
+        "dry-run must leave oci_tags untouched"
+    );
+
+    // Real run: artifact is soft-deleted and the cascade removes the tag row.
+    let result = svc
+        .execute_policy(policy.id, false)
+        .await
+        .expect("execution failed");
+    assert_eq!(result.artifacts_removed, 1);
+
+    assert!(
+        is_deleted(&pool, ephemeral_id).await,
+        "ephemeral artifact should be soft-deleted"
+    );
+    assert!(
+        !is_deleted(&pool, release_id).await,
+        "release artifact must not be touched"
+    );
+
+    // Regression assertion (the bug this PR fixes).
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "myimg", "build-snapshot-images").await,
+        "cascade should remove oci_tags row for soft-deleted manifest"
+    );
+    // Sanity: the release tag is still alive.
+    assert!(
+        oci_tag_exists(&pool, repo_id, "myimg", "v1.0.0").await,
+        "release oci_tag must survive"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// max_age_days policy soft-deletes by age; the cascade must also fire.
+#[tokio::test]
+#[ignore]
+async fn test_max_age_days_cascades_oci_tags() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_id = create_test_repo(&pool, &format!("test-cascade-age-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    let old_digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    let old_id =
+        insert_oci_manifest_artifact(&pool, repo_id, "myimg", "old", old_digest, 100).await;
+    insert_oci_tag(&pool, repo_id, "myimg", "old", old_digest).await;
+
+    // Backdate the artifact to look 10 days old.
+    sqlx::query("UPDATE artifacts SET created_at = NOW() - INTERVAL '10 days' WHERE id = $1")
+        .bind(old_id)
+        .execute(&pool)
+        .await
+        .expect("backdate failed");
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_id),
+            name: "Drop > 7 days".to_string(),
+            description: None,
+            policy_type: "max_age_days".to_string(),
+            config: serde_json::json!({"days": 7}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .expect("failed to create policy");
+
+    let result = svc.execute_policy(policy.id, false).await.unwrap();
+    assert_eq!(result.artifacts_removed, 1);
+    assert!(is_deleted(&pool, old_id).await);
+    assert!(
+        !oci_tag_exists(&pool, repo_id, "myimg", "old").await,
+        "max_age_days must also cascade oci_tags"
+    );
+
+    cleanup(&pool, repo_id).await;
+}
+
+/// Repo-scoped policy must not delete oci_tags in other repos.
+#[tokio::test]
+#[ignore]
+async fn test_cascade_respects_repo_scope() {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .expect("failed to connect to database");
+
+    let repo_a = create_test_repo(&pool, &format!("test-cascade-a-{}", Uuid::new_v4())).await;
+    let repo_b = create_test_repo(&pool, &format!("test-cascade-b-{}", Uuid::new_v4())).await;
+    let svc = LifecycleService::new(pool.clone());
+
+    // Same image:tag with the same digest in two repos; the artifact in
+    // repo_b is already soft-deleted (e.g., from an earlier cleanup) but
+    // a policy targeting repo_a must NOT cascade its tag row.
+    let digest = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    let a_id =
+        insert_oci_manifest_artifact(&pool, repo_a, "img", "snapshot-images", digest, 100).await;
+    let b_id =
+        insert_oci_manifest_artifact(&pool, repo_b, "img", "snapshot-images", digest, 100).await;
+    insert_oci_tag(&pool, repo_a, "img", "snapshot-images", digest).await;
+    insert_oci_tag(&pool, repo_b, "img", "snapshot-images", digest).await;
+
+    // Mark repo_b's artifact soft-deleted with no policy involvement.
+    sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+        .bind(b_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let policy = svc
+        .create_policy(CreatePolicyRequest {
+            repository_id: Some(repo_a),
+            name: "Drop snapshots in A".to_string(),
+            description: None,
+            policy_type: "tag_pattern_delete".to_string(),
+            config: serde_json::json!({"pattern": "-images$"}),
+            priority: None,
+            cron_schedule: None,
+        })
+        .await
+        .unwrap();
+
+    let _ = svc.execute_policy(policy.id, false).await.unwrap();
+
+    assert!(is_deleted(&pool, a_id).await);
+    assert!(
+        !oci_tag_exists(&pool, repo_a, "img", "snapshot-images").await,
+        "tag in repo_a must be cascaded"
+    );
+    assert!(
+        oci_tag_exists(&pool, repo_b, "img", "snapshot-images").await,
+        "tag in repo_b must NOT be touched by a repo_a-scoped policy"
+    );
+
+    cleanup(&pool, repo_a).await;
+    cleanup(&pool, repo_b).await;
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_size_quota_under_limit_evicts_nothing() {
