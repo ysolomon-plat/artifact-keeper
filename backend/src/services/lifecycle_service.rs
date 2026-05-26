@@ -307,13 +307,34 @@ impl LifecycleService {
 
     /// Execute a policy (dry_run=true previews without deleting).
     ///
-    /// For real runs the soft-delete, oci_tags cascade and `last_run_at`
-    /// bookkeeping all happen inside a single Postgres transaction. Without
-    /// this, a crash (or any DB error) between the per-type execute and the
-    /// cascade leaves the system in the exact broken state the cascade was
-    /// added to fix: artifacts soft-deleted but `oci_tags` still pointing at
-    /// the manifest, so the storage GC orphan predicate (#1144) treats the
-    /// manifest as live and never reclaims it.
+    /// Real runs split work across three short transactions instead of one
+    /// long-held one. On a busy cluster with the default 50-conn pool, the
+    /// previous single-transaction design pinned one connection for the
+    /// entire run (minutes on large repos under `execute_no_downloads` /
+    /// `execute_size_quota`) and held row locks on `artifacts` that blocked
+    /// concurrent uploads. `execute_all_enabled` runs policies serially,
+    /// multiplying the held time.
+    ///
+    /// Split layout:
+    /// 1. **dispatch tx** — per-type `execute_*` (`UPDATE artifacts SET
+    ///    is_deleted = true`). Committed immediately so row locks release
+    ///    before the cascade and bookkeeping touch the pool again.
+    /// 2. **cascade tx** — `DELETE FROM oci_tags ...` filtered on
+    ///    `a.is_deleted = true`. Idempotent: rerunning finds whatever the
+    ///    prior tx missed, deletes nothing the second time.
+    /// 3. **bookkeeping** — `UPDATE lifecycle_policies SET last_run_at`,
+    ///    issued against the pool directly (no tx needed for a one-row
+    ///    update).
+    ///
+    /// Crash recovery: a crash between tx1 and tx2 leaves orphan `oci_tags`
+    /// rows for the just-soft-deleted manifests. They are not lost forever
+    /// because every subsequent cascade sweep filters on `is_deleted = true`
+    /// globally (when `policy.repository_id IS NULL`) or scoped to the same
+    /// repo — the next policy run picks them up. Eventual consistency at
+    /// minutes-scale, not forever-stuck. This is acceptable because storage
+    /// GC (#1144) only runs after a configurable retention window anyway.
+    /// A crash between tx2 and bookkeeping leaves `last_run_at` stale, so
+    /// the policy runs again on the next tick — same idempotent cascade.
     pub async fn execute_policy(&self, id: Uuid, dry_run: bool) -> Result<PolicyExecutionResult> {
         let policy = self.get_policy(id).await?;
 
@@ -335,34 +356,42 @@ impl LifecycleService {
             return Self::dispatch_execute(&mut conn, &policy, true).await;
         }
 
-        // Real run: soft-delete + cascade + last_run_at as one unit.
+        // Transaction 1: per-type soft-delete. Commit immediately so the
+        // row locks on `artifacts` release before any further pool work,
+        // unblocking concurrent uploads/scans.
         let mut tx = self
             .db
             .begin()
             .await
             .map_err(|e| AppError::Database(e.to_string()))?;
-
         let result = Self::dispatch_execute(&mut tx, &policy, false).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Bring oci_tags in line with the freshly soft-deleted manifest
-        // artifacts before recording last_run. Without this, storage GC sees
-        // a live oci_tags row pointing at the manifest's storage_key and
-        // never reclaims it, so the manifest JSON (and, transitively, every
-        // blob layer reachable only through it) stays in S3 forever.
+        // Transaction 2: cascade `oci_tags` for the artifacts soft-deleted
+        // above (and any orphans from a prior crashed run). Idempotent — the
+        // filter `a.is_deleted = true` plus the path/digest join makes
+        // re-runs no-ops once everything is cleaned up.
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
         Self::cascade_oci_tags_cleanup_tx(&mut tx, policy.repository_id).await?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // Bookkeeping: single-row update, no transaction needed.
         sqlx::query(
             "UPDATE lifecycle_policies SET last_run_at = NOW(), last_run_items_removed = $2 WHERE id = $1",
         )
         .bind(id)
         .bind(result.artifacts_removed)
-        .execute(&mut *tx)
+        .execute(&self.db)
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(result)
     }
@@ -401,11 +430,12 @@ impl LifecycleService {
     /// that repo; a global policy (`repository_id IS NULL`) cleans across
     /// every repo. Idempotent on re-runs.
     ///
-    /// Runs against the caller's connection. In `execute_policy` the caller
-    /// re-borrows a transaction (`&mut *tx`) so the soft-delete and the
-    /// cascade commit atomically. A crash between the two (which used to be
-    /// two separate pool round-trips) would leave the manifest soft-deleted
-    /// but the tag row alive, which is exactly the bug this PR fixes.
+    /// Runs against the caller's connection. `execute_policy` calls this
+    /// inside its own short cascade transaction, separate from the per-type
+    /// soft-delete transaction, so row locks on `artifacts` release as
+    /// early as possible. The cascade is idempotent (`a.is_deleted = true`
+    /// filter): if a crash leaves orphan `oci_tags` rows between the two
+    /// transactions, the next policy run's cascade sweep reclaims them.
     async fn cascade_oci_tags_cleanup_tx(
         conn: &mut sqlx::PgConnection,
         repository_id: Option<Uuid>,
