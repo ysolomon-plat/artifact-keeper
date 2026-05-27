@@ -6,6 +6,12 @@
 //! - Progress tracking
 //! - Checkpoint saving for resumability
 
+use crate::models::migration::{MigrationItemType, MigrationJobStatus};
+use crate::services::artifact_service::ArtifactService;
+use crate::services::artifactory_client::ArtifactoryClient;
+use crate::services::migration_service::{ConflictType, MigrationError, MigrationService};
+use crate::services::source_registry::SourceRegistry;
+use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -13,12 +19,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use crate::models::migration::{MigrationItemType, MigrationJobStatus};
-use crate::services::artifact_service::ArtifactService;
-use crate::services::artifactory_client::ArtifactoryClient;
-use crate::services::migration_service::{ConflictType, MigrationError, MigrationService};
-use crate::services::source_registry::SourceRegistry;
-use crate::storage::{StorageBackend, StorageLocation, StorageRegistry};
 
 /// Configuration for the migration worker
 #[derive(Debug, Clone)]
@@ -140,13 +140,15 @@ impl MigrationWorker {
         }
     }
 
-    async fn storage_for_repo(&self, repo_key: &str) -> Result<Arc<dyn StorageBackend>, MigrationError> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT storage_backend, storage_path FROM repositories WHERE key = $1",
-        )
-        .bind(repo_key)
-        .fetch_optional(&self.db)
-        .await?;
+    async fn storage_for_repo(
+        &self,
+        repo_key: &str,
+    ) -> Result<Arc<dyn StorageBackend>, MigrationError> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT storage_backend, storage_path FROM repositories WHERE key = $1")
+                .bind(repo_key)
+                .fetch_optional(&self.db)
+                .await?;
 
         let (backend, path) = row.ok_or_else(|| {
             MigrationError::StorageError(format!(
@@ -776,7 +778,6 @@ impl MigrationWorker {
         )
     }
 
-
     /// Send a progress update through the channel, if one is configured
     #[allow(clippy::too_many_arguments)]
     async fn send_progress_update(
@@ -881,7 +882,9 @@ impl MigrationWorker {
                     if let Some(expected_sha256) = expected.sha256.as_deref() {
                         Ok(expected_sha256 == existing_sha256)
                     } else if let Some(expected_sha1) = expected.sha1.as_deref() {
-                        Ok(existing_sha1.as_deref().map_or(true, |s| s == expected_sha1))
+                        Ok(existing_sha1
+                            .as_deref()
+                            .map_or(true, |s| s == expected_sha1))
                     } else {
                         Ok(true)
                     }
@@ -919,14 +922,8 @@ impl MigrationWorker {
         // before the storage put so only the temp file holds the payload.
         let artifact_data = client.download_artifact(repo_key, artifact_path).await?;
 
-        let mut sha256_hasher = Sha256::new();
-        let mut sha1_hasher = Sha1::new();
         let content_size = artifact_data.len() as i64;
-        sha256_hasher.update(&artifact_data);
-        sha1_hasher.update(&artifact_data);
-
-        let sha256_hex = format!("{:x}", sha256_hasher.finalize());
-        let sha1_hex = format!("{:x}", sha1_hasher.finalize());
+        let (sha256_hex, sha1_hex) = compute_dual_checksums(&artifact_data);
 
         // Extract format-specific package metadata (npm package.json, helm
         // Chart.yaml, etc.) from the artifact bytes BEFORE we move them
@@ -944,14 +941,18 @@ impl MigrationWorker {
         // Persist payload to temp file, then drop the in-memory Bytes so the
         // subsequent storage.put_file uploads from the temp file rather than
         // holding the entire artifact in memory alongside the file copy.
-        let mut file = tokio::fs::File::create(&temp_file_path).await
-            .map_err(|e| MigrationError::StorageError(format!("Failed to create temp file: {}", e)))?;
-        use tokio::io::AsyncWriteExt;
-        file.write_all(&artifact_data)
+        let mut file = tokio::fs::File::create(&temp_file_path)
             .await
-            .map_err(|e| MigrationError::StorageError(format!("Failed to write to temp file: {}", e)))?;
-        file.sync_all().await
-            .map_err(|e| MigrationError::StorageError(format!("Failed to sync temp file: {}", e)))?;
+            .map_err(|e| {
+                MigrationError::StorageError(format!("Failed to create temp file: {}", e))
+            })?;
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&artifact_data).await.map_err(|e| {
+            MigrationError::StorageError(format!("Failed to write to temp file: {}", e))
+        })?;
+        file.sync_all().await.map_err(|e| {
+            MigrationError::StorageError(format!("Failed to sync temp file: {}", e))
+        })?;
         drop(file);
         drop(artifact_data);
 
