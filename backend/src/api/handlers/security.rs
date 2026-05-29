@@ -90,6 +90,20 @@ pub struct ScoreResponse {
 pub struct TriggerScanRequest {
     pub artifact_id: Option<Uuid>,
     pub repository_id: Option<Uuid>,
+    /// Skip the hash-based scan dedup short-circuit when running this scan.
+    ///
+    /// Defaults to `false`. Normal trigger calls dedup against prior
+    /// completed scans for the same checksum + scan_type so a freshly
+    /// uploaded byte-identical artifact reuses the existing result instead
+    /// of re-running the scanner. When `true`, that dedup is skipped: the
+    /// scanner runs against the bytes again and writes a fresh
+    /// `scan_results` row. Use this to recover from a silently-broken
+    /// prior scan (e.g. an extraction bug producing a completed,
+    /// zero-finding row that masks the real findings until the dedup TTL
+    /// expires; see #1469). Costs an extra scan run, so leave it unset
+    /// for routine trigger calls.
+    #[serde(default)]
+    pub bypass_dedup: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -555,19 +569,30 @@ async fn trigger_scan(
         .ok_or_else(|| AppError::ServiceUnavailable("Scanner service not configured".to_string()))?
         .clone();
 
+    let bypass_dedup = body.bypass_dedup.unwrap_or(false);
+
     if let Some(artifact_id) = body.artifact_id {
         // Pre-allocate one scan_result row per configured scanner so the IDs
         // can be returned in this response. The actual scan work is still
         // fire-and-forget (tokio::spawn) but uses these pre-committed IDs
         // instead of inserting new rows. See artifact-keeper#906.
-        let prepared = scanner.prepare_artifact_scan(artifact_id, true).await?;
+        //
+        // `bypass_dedup` (#1469) must be passed to BOTH prepare and execute:
+        // prepare needs it so the same-artifact short-circuit doesn't return
+        // the stale completed row's id (which would leave the worker with
+        // nothing to do); execute needs it so the cross-artifact reuse path
+        // doesn't copy the same stale row into a new `is_reused = true` row
+        // for the newly-allocated placeholder.
+        let prepared = scanner
+            .prepare_artifact_scan(artifact_id, true, bypass_dedup)
+            .await?;
         let scan_result_ids = crate::services::scanner_service::extract_scan_result_ids(&prepared);
         let prepared_map = crate::services::scanner_service::prepared_pairs_to_map(prepared);
 
         let scanner_for_spawn = scanner.clone();
         tokio::spawn(async move {
             if let Err(e) = scanner_for_spawn
-                .scan_artifact_with_prepared(artifact_id, prepared_map, true)
+                .scan_artifact_with_prepared(artifact_id, prepared_map, true, bypass_dedup)
                 .await
             {
                 tracing::error!("Scan failed for artifact {}: {}", artifact_id, e);
@@ -594,7 +619,7 @@ async fn trigger_scan(
 
     tokio::spawn(async move {
         if let Err(e) = scanner
-            .scan_repository_with_options(repository_id, true)
+            .scan_repository_with_options(repository_id, true, bypass_dedup)
             .await
         {
             tracing::error!("Repository scan failed for {}: {}", repository_id, e);
@@ -1644,6 +1669,32 @@ mod tests {
         let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.artifact_id, None);
         assert_eq!(req.repository_id, None);
+        assert_eq!(
+            req.bypass_dedup, None,
+            "bypass_dedup must default to None when the field is omitted, so existing \
+             clients that pre-date #1469 keep their cache-friendly trigger semantics"
+        );
+    }
+
+    #[test]
+    fn test_trigger_scan_request_serde_bypass_dedup_true() {
+        // #1469: the explicit "rescan now, ignore cached results" path.
+        // Pinned because the handler maps None -> false, so a regression
+        // that drops the field from the struct or renames it would silently
+        // collapse `{"bypass_dedup": true}` back to the cached path.
+        let aid = Uuid::new_v4();
+        let json = serde_json::json!({ "artifact_id": aid, "bypass_dedup": true });
+        let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.artifact_id, Some(aid));
+        assert_eq!(req.bypass_dedup, Some(true));
+    }
+
+    #[test]
+    fn test_trigger_scan_request_serde_bypass_dedup_false() {
+        let aid = Uuid::new_v4();
+        let json = serde_json::json!({ "artifact_id": aid, "bypass_dedup": false });
+        let req: TriggerScanRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.bypass_dedup, Some(false));
     }
 
     // -----------------------------------------------------------------------

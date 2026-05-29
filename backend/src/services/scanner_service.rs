@@ -49,6 +49,30 @@ use crate::storage::StorageBackend;
 /// up freshly-published advisories.
 pub(crate) const DEDUP_TTL_DAYS: i32 = 30;
 
+/// Shorter TTL window (in days) applied to completed scan rows whose
+/// `findings_count = 0`.
+///
+/// A zero-finding completed row is ambiguous: it can mean "scanner ran and
+/// the artifact is genuinely clean" OR "scanner ran but an upstream
+/// extraction / staging step produced an empty tree, so the scanner walked
+/// nothing and produced nothing" (#1469, #1427, #1428). The standard
+/// 30-day window silently masks the latter case for a month, so the
+/// operator-visible "rescan" after fixing the extraction bug keeps
+/// returning the cached empty result.
+///
+/// One day is short enough that any rebuild-fix-rescan loop sees a fresh
+/// scan well within the same working day, but long enough to suppress the
+/// trivial duplicate scans that #1373 was originally about (two concurrent
+/// trigger calls on the same upload). Genuinely-clean artifacts still
+/// dedup for the shorter window, which is the only cost.
+///
+/// Set to 1 (vs. e.g. 7) deliberately so an operator iterating on a
+/// pipeline bug never has to wait more than 24h for the cached false-clean
+/// to expire on its own. The `bypass_dedup` flag on
+/// [`crate::api::handlers::security::TriggerScanRequest`] is the explicit
+/// escape hatch for the impatient case.
+pub(crate) const ZERO_FINDINGS_DEDUP_TTL_DAYS: i32 = 1;
+
 /// Upper bound on the size of a single artifact we are willing to stage for
 /// scanning. Beyond this we reject the input rather than consume unbounded
 /// disk and virtual address space. 10 GiB is generous for real packages while
@@ -2473,10 +2497,17 @@ impl ScannerService {
     /// repository and `force` is false (matching `scan_artifact_with_options`).
     /// Returns `Ok(vec![])` when the artifact is missing or soft-deleted, so
     /// the caller can decide whether to surface a 404 separately.
+    ///
+    /// When `bypass_dedup` is true the same-artifact short-circuit added for
+    /// #1373 is skipped: every configured scanner gets a fresh placeholder
+    /// row, and the worker will always run a fresh scan (no cached results
+    /// are copied). This is the explicit "ignore the cache, scan again now"
+    /// path used to recover from silently-broken prior scans (#1469).
     pub async fn prepare_artifact_scan(
         &self,
         artifact_id: Uuid,
         force: bool,
+        bypass_dedup: bool,
     ) -> Result<Vec<(String, Uuid)>> {
         let artifact = sqlx::query!(
             r#"
@@ -2517,17 +2548,25 @@ impl ScannerService {
         // gets the missing scanner queued normally.
         let mut prepared = Vec::with_capacity(self.scanners.len());
         for scanner in &self.scanners {
-            let existing = self
-                .scan_result_service
-                .find_existing_scan_for_artifact(
-                    artifact_id,
-                    &artifact.checksum_sha256,
-                    scanner.scan_type(),
-                    DEDUP_TTL_DAYS,
-                )
-                .await
-                .ok()
-                .flatten();
+            // When the caller asked to bypass dedup, skip the lookup entirely
+            // and always insert a fresh placeholder. We deliberately don't
+            // even SELECT here so the explicit-rescan path can't accidentally
+            // be diverted by a row that happens to satisfy the TTL.
+            let existing = if bypass_dedup {
+                None
+            } else {
+                self.scan_result_service
+                    .find_existing_scan_for_artifact(
+                        artifact_id,
+                        &artifact.checksum_sha256,
+                        scanner.scan_type(),
+                        DEDUP_TTL_DAYS,
+                        ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+            };
 
             match decide_short_circuit_from_existing(existing.as_ref()) {
                 ShortCircuitDecision::UseExisting(id) => {
@@ -2559,13 +2598,21 @@ impl ScannerService {
     /// new ones. Falls back to creating a row on the fly if a scanner has no
     /// matching prepared ID (e.g. scanner set changed between prepare and
     /// execute).
+    ///
+    /// `bypass_dedup` must match the value passed to the matching
+    /// `prepare_artifact_scan` call: if the caller skipped the same-artifact
+    /// short-circuit there, the worker must also skip the cross-artifact
+    /// reuse path here so the freshly-allocated placeholder rows are not
+    /// converted into `is_reused = true` rows pointing at the very cached
+    /// result the caller was trying to bypass (#1469).
     pub async fn scan_artifact_with_prepared(
         &self,
         artifact_id: Uuid,
         prepared: HashMap<String, Uuid>,
         force: bool,
+        bypass_dedup: bool,
     ) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, force, Some(prepared))
+        self.scan_artifact_inner(artifact_id, force, bypass_dedup, Some(prepared))
             .await
     }
 
@@ -2573,14 +2620,23 @@ impl ScannerService {
     /// recalculate the repository security score.
     /// Scan a single artifact. When `force` is true, skip the repo scan-enabled check
     /// (used for on-demand scans triggered manually by an admin).
-    pub async fn scan_artifact_with_options(&self, artifact_id: Uuid, force: bool) -> Result<()> {
-        self.scan_artifact_inner(artifact_id, force, None).await
+    /// When `bypass_dedup` is true, also skip the hash-based scan dedup so a
+    /// silently-broken prior scan does not mask the re-scan (#1469).
+    pub async fn scan_artifact_with_options(
+        &self,
+        artifact_id: Uuid,
+        force: bool,
+        bypass_dedup: bool,
+    ) -> Result<()> {
+        self.scan_artifact_inner(artifact_id, force, bypass_dedup, None)
+            .await
     }
 
     async fn scan_artifact_inner(
         &self,
         artifact_id: Uuid,
         force: bool,
+        bypass_dedup: bool,
         prepared: Option<HashMap<String, Uuid>>,
     ) -> Result<()> {
         // Fetch artifact and content
@@ -2683,12 +2739,25 @@ impl ScannerService {
                 continue;
             }
 
-            // Check for reusable scan results (same hash + scan type within TTL)
-            if let Ok(Some(source_scan)) = self
-                .scan_result_service
-                .find_reusable_scan(checksum, scanner.scan_type(), DEDUP_TTL_DAYS)
-                .await
-            {
+            // Check for reusable scan results (same hash + scan type within TTL).
+            // The bypass_dedup flag (#1469) short-circuits this so the explicit
+            // "rescan now" path cannot be silently fed a cached result that was
+            // exactly what the caller was trying to escape from.
+            let reusable = if bypass_dedup {
+                None
+            } else {
+                self.scan_result_service
+                    .find_reusable_scan(
+                        checksum,
+                        scanner.scan_type(),
+                        DEDUP_TTL_DAYS,
+                        ZERO_FINDINGS_DEDUP_TTL_DAYS,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            if let Some(source_scan) = reusable {
                 // #1373: when the matched source scan is for THIS artifact,
                 // a completed scan for these exact bytes already exists. We
                 // must not run a fresh scan or copy results into a new row;
@@ -3209,21 +3278,25 @@ impl ScannerService {
 
     /// Scan a single artifact (respects repo scan-enabled config).
     pub async fn scan_artifact(&self, artifact_id: Uuid) -> Result<()> {
-        self.scan_artifact_with_options(artifact_id, false).await
+        self.scan_artifact_with_options(artifact_id, false, false)
+            .await
     }
 
     /// Scan all non-deleted artifacts in a repository.
     pub async fn scan_repository(&self, repository_id: Uuid) -> Result<u32> {
-        self.scan_repository_with_options(repository_id, false)
+        self.scan_repository_with_options(repository_id, false, false)
             .await
     }
 
     /// Scan all artifacts in a repository.
     /// When `force` is true, bypass the scan-enabled config check (for manual triggers).
+    /// When `bypass_dedup` is true, also bypass the hash-based scan dedup so a
+    /// silently-broken prior scan does not mask the re-scan (#1469).
     pub async fn scan_repository_with_options(
         &self,
         repository_id: Uuid,
         force: bool,
+        bypass_dedup: bool,
     ) -> Result<u32> {
         let artifact_ids: Vec<Uuid> = sqlx::query_scalar!(
             "SELECT id FROM artifacts WHERE repository_id = $1 AND is_deleted = false",
@@ -3235,12 +3308,15 @@ impl ScannerService {
 
         let count = artifact_ids.len() as u32;
         info!(
-            "Starting repository scan for {}: {} artifacts (force={})",
-            repository_id, count, force
+            "Starting repository scan for {}: {} artifacts (force={}, bypass_dedup={})",
+            repository_id, count, force, bypass_dedup
         );
 
         for artifact_id in artifact_ids {
-            if let Err(e) = self.scan_artifact_with_options(artifact_id, force).await {
+            if let Err(e) = self
+                .scan_artifact_with_options(artifact_id, force, bypass_dedup)
+                .await
+            {
                 warn!(
                     "Failed to scan artifact {} in repo {}: {}",
                     artifact_id, repository_id, e
@@ -9206,6 +9282,27 @@ mod tests {
         // for #1373) read this constant. A future tweak to the window should
         // be a deliberate change with a CHANGELOG entry, not a silent edit.
         assert_eq!(super::DEDUP_TTL_DAYS, 30);
+    }
+
+    #[test]
+    fn test_zero_findings_dedup_ttl_days_is_short() {
+        // #1469: zero-finding completed rows are ambiguous (clean OR silent
+        // extraction failure), so they must dedup for a much shorter window
+        // than the standard 30 days. The exact value is policy, but pin
+        // both endpoints so a future widening (e.g. back to 30) is a
+        // deliberate edit a reviewer can flag.
+        assert_eq!(super::ZERO_FINDINGS_DEDUP_TTL_DAYS, 1);
+
+        // Read both into runtime locals so the comparison is not a
+        // const-folded `1 < 30` (which clippy correctly flags as a noop
+        // assertion) but still trips the test if a future edit collapses
+        // the two windows to the same value.
+        let zero = super::ZERO_FINDINGS_DEDUP_TTL_DAYS;
+        let standard = super::DEDUP_TTL_DAYS;
+        assert!(
+            zero < standard,
+            "zero-finding TTL ({zero}) must be strictly shorter than the standard TTL ({standard}) or the policy collapses to a uniform window",
+        );
     }
 
     // -----------------------------------------------------------------------
