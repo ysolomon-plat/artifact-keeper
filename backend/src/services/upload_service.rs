@@ -1743,4 +1743,199 @@ mod tests {
         let long_path = "a/".repeat(100) + "file.bin";
         assert!(validate_artifact_path(&long_path).is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // DB-backed reassembly tests (in-order, OUT-OF-ORDER, checksum match).
+    //
+    // These exercise the real `create_session` -> `upload_chunk` ->
+    // `complete_session` path against Postgres. They reproduce the
+    // chunked-upload data-corruption gate failure (gate run 26616763325):
+    // when chunks arrive out of order, the temp file must still be
+    // reassembled strictly by byte offset so the finalize checksum matches
+    // the client checksum.
+    //
+    // No-ops when `DATABASE_URL` is unset (matches the project-wide handler
+    // test pattern). CI runs these with Postgres up + migrations applied.
+    // -----------------------------------------------------------------------
+    use crate::api::handlers::test_db_helpers as tdh;
+
+    /// Hex SHA256 of a byte slice.
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Drive a full chunked upload, sending chunk indices in `order`.
+    ///
+    /// `payload` is split into `chunk_size`-byte chunks. Each chunk is sent
+    /// via `UploadService::upload_chunk` with its true byte offset (mirroring
+    /// the handler, which derives offset from the Content-Range header). The
+    /// session is then finalized via `complete_session`, which recomputes the
+    /// temp-file SHA256 and compares it to the registered checksum. Returns
+    /// the `complete_session` result so callers can assert success/failure.
+    async fn run_chunked_upload_in_order(
+        f: &tdh::Fixture,
+        artifact_path: &str,
+        payload: &[u8],
+        chunk_size: i32,
+        order: &[i32],
+    ) -> Result<UploadSession, UploadError> {
+        let checksum = sha256_hex(payload);
+
+        let session = UploadService::create_session(CreateSessionParams {
+            db: &f.pool,
+            storage_path: f.storage_dir.to_str().unwrap(),
+            user_id: f.user_id,
+            repo_id: f.repo_id,
+            repo_key: &f.repo_key,
+            artifact_path,
+            total_size: payload.len() as i64,
+            chunk_size: Some(chunk_size),
+            checksum_sha256: &checksum,
+            content_type: Some("application/octet-stream"),
+        })
+        .await?;
+
+        for &idx in order {
+            let offset = idx as i64 * chunk_size as i64;
+            let end = ((offset + chunk_size as i64) as usize).min(payload.len());
+            let slice = &payload[offset as usize..end];
+            UploadService::upload_chunk(
+                &f.pool,
+                session.id,
+                idx,
+                offset,
+                bytes::Bytes::copy_from_slice(slice),
+                f.user_id,
+            )
+            .await?;
+        }
+
+        UploadService::complete_session(&f.pool, session.id, f.user_id).await
+    }
+
+    async fn cleanup_session(f: &tdh::Fixture, session_id: Uuid, temp_path: &str) {
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = tokio::fs::remove_file(temp_path).await;
+    }
+
+    #[tokio::test]
+    async fn reassembly_in_order_matches_client_checksum() {
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        // 3 chunks of 1 MB each, distinct content per chunk so a wrong
+        // ordering produces a different SHA256.
+        let chunk_size = 1024 * 1024_i32;
+        let mut payload = Vec::with_capacity(3 * chunk_size as usize);
+        payload.extend(std::iter::repeat(0xAAu8).take(chunk_size as usize));
+        payload.extend(std::iter::repeat(0xBBu8).take(chunk_size as usize));
+        payload.extend(std::iter::repeat(0xCCu8).take(chunk_size as usize));
+        let expected = sha256_hex(&payload);
+
+        let result =
+            run_chunked_upload_in_order(&f, "test/in-order.bin", &payload, chunk_size, &[0, 1, 2])
+                .await;
+
+        match result {
+            Ok(session) => {
+                assert_eq!(
+                    session.checksum_sha256, expected,
+                    "in-order reassembly must match client checksum"
+                );
+                cleanup_session(&f, session.id, &session.temp_file_path).await;
+            }
+            Err(e) => panic!("in-order reassembly failed: {e}"),
+        }
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn reassembly_out_of_order_matches_client_checksum() {
+        // This is the failing case from gate run 26616763325: chunks arrive
+        // 2, 0, 1 but the finalized file must still be byte-identical to the
+        // client's, i.e. reassembled strictly by offset, not arrival order.
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let chunk_size = 1024 * 1024_i32;
+        let mut payload = Vec::with_capacity(3 * chunk_size as usize);
+        payload.extend(std::iter::repeat(0x11u8).take(chunk_size as usize));
+        payload.extend(std::iter::repeat(0x22u8).take(chunk_size as usize));
+        payload.extend(std::iter::repeat(0x33u8).take(chunk_size as usize));
+        let expected = sha256_hex(&payload);
+
+        let result = run_chunked_upload_in_order(
+            &f,
+            "test/out-of-order.bin",
+            &payload,
+            chunk_size,
+            &[2, 0, 1],
+        )
+        .await;
+
+        match result {
+            Ok(session) => {
+                assert_eq!(
+                    session.checksum_sha256, expected,
+                    "OUT-OF-ORDER reassembly must match client checksum \
+                     (chunks arrived 2,0,1 but file must be byte-identical)"
+                );
+                cleanup_session(&f, session.id, &session.temp_file_path).await;
+            }
+            Err(UploadError::ChecksumMismatch { expected, actual }) => panic!(
+                "OUT-OF-ORDER reassembly corrupted data: finalize checksum \
+                 mismatch (expected {expected}, got {actual}). Chunks were not \
+                 reassembled by offset."
+            ),
+            Err(e) => panic!("OUT-OF-ORDER reassembly failed: {e}"),
+        }
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn reassembly_last_partial_chunk_out_of_order() {
+        // 2.5 MB file with 1 MB chunks -> 3 chunks, last is 0.5 MB. Send the
+        // partial last chunk first, then the middle, then the first.
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let chunk_size = 1024 * 1024_i32;
+        let total = 2 * chunk_size as usize + chunk_size as usize / 2;
+        let mut payload = Vec::with_capacity(total);
+        for i in 0..total {
+            payload.push((i % 251) as u8);
+        }
+        let expected = sha256_hex(&payload);
+
+        let result = run_chunked_upload_in_order(
+            &f,
+            "test/partial-ooo.bin",
+            &payload,
+            chunk_size,
+            &[2, 1, 0],
+        )
+        .await;
+
+        match result {
+            Ok(session) => {
+                assert_eq!(session.total_size as usize, total);
+                assert_eq!(
+                    session.checksum_sha256, expected,
+                    "partial-last-chunk OUT-OF-ORDER reassembly must match checksum"
+                );
+                cleanup_session(&f, session.id, &session.temp_file_path).await;
+            }
+            Err(e) => panic!("partial-chunk OUT-OF-ORDER reassembly failed: {e}"),
+        }
+        f.teardown().await;
+    }
 }

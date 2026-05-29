@@ -1608,4 +1608,113 @@ mod tests {
             .await;
         f.teardown().await;
     }
+
+    #[tokio::test]
+    async fn out_of_order_chunks_finalize_and_download_match_checksum() {
+        // Full HTTP path reproduction of the gate failure (run 26616763325,
+        // edge-cases "Out-of-order chunk upload"): create a 3-chunk session,
+        // PATCH chunks in the order 2, 0, 1, finalize, then read the stored
+        // bytes back. The on-disk bytes must be byte-identical to the client
+        // payload regardless of arrival order, so finalize returns 200 (not
+        // 409 checksum mismatch) and the read-back SHA256 matches.
+        let Some(f) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        // Distinct content per chunk so a wrong ordering changes the SHA256.
+        let chunk_size: usize = 1024 * 1024; // 1 MB
+        let mut payload = Vec::with_capacity(3 * chunk_size);
+        payload.extend(std::iter::repeat(0x11u8).take(chunk_size));
+        payload.extend(std::iter::repeat(0x22u8).take(chunk_size));
+        payload.extend(std::iter::repeat(0x33u8).take(chunk_size));
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        let checksum = hex::encode(hasher.finalize());
+
+        // 1) Create session.
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let create_req = create_session_req(&serde_json::json!({
+            "repository_key": f.repo_key,
+            "artifact_path": "test/ooo-file.bin",
+            "total_size": payload.len() as i64,
+            "checksum_sha256": checksum,
+            "chunk_size": chunk_size as i64,
+        }));
+        let (status, body) = tdh::send(app, create_req).await;
+        assert_eq!(status, StatusCode::CREATED, "create_session must succeed");
+        let create_resp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let session_id: Uuid =
+            serde_json::from_value(create_resp["session_id"].clone()).expect("session_id");
+
+        // 2) PATCH chunks out of order: 2, 0, 1.
+        for &idx in &[2usize, 0, 1] {
+            let start = idx * chunk_size;
+            let end = ((idx + 1) * chunk_size).min(payload.len());
+            let slice = payload[start..end].to_vec();
+            let app =
+                upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+            let req = axum::http::Request::builder()
+                .method("PATCH")
+                .uri(format!("/{}", session_id))
+                .header(
+                    "content-range",
+                    format!("bytes {}-{}/{}", start, end - 1, payload.len()),
+                )
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(slice))
+                .unwrap();
+            let (status, body) = tdh::send(app, req).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "out-of-order chunk {} PATCH must succeed; body: {}",
+                idx,
+                String::from_utf8_lossy(&body)
+            );
+        }
+
+        // 3) Finalize: this recomputes the temp-file SHA256. If reassembly
+        //    used arrival order instead of offset, this returns 409.
+        let app = upload_router_with_auth(f.state.clone(), tdh::make_auth(f.user_id, &f.username));
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/{}/complete", session_id))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "finalize after out-of-order upload must return 200, not 409 \
+             checksum mismatch; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // 4) Read the stored bytes back via the same backend and verify they
+        //    are byte-identical to the client payload.
+        let expected_key =
+            crate::services::artifact_service::ArtifactService::storage_key_from_checksum(
+                &checksum,
+            );
+        let on_disk_path = f.storage_dir.join(&expected_key);
+        let read_back = std::fs::read(&on_disk_path).expect("read back stored artifact");
+        let mut rb_hasher = Sha256::new();
+        rb_hasher.update(&read_back);
+        let read_back_checksum = hex::encode(rb_hasher.finalize());
+        assert_eq!(
+            read_back_checksum, checksum,
+            "downloaded bytes must match the client checksum after out-of-order reassembly"
+        );
+
+        let _ = sqlx::query("DELETE FROM upload_chunks WHERE session_id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM upload_sessions WHERE id = $1")
+            .bind(session_id)
+            .execute(&f.pool)
+            .await;
+        f.teardown().await;
+    }
 }
