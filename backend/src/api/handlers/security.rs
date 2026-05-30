@@ -102,6 +102,13 @@ pub struct TriggerScanRequest {
     /// zero-finding row that masks the real findings until the dedup TTL
     /// expires; see #1469). Costs an extra scan run, so leave it unset
     /// for routine trigger calls.
+    ///
+    /// **Admin only.** Setting this to `true` bypasses the dedup short-
+    /// circuit and fans out unbounded scanner work per artifact. The
+    /// `trigger_scan` handler rejects this field with 403 for non-admin
+    /// callers, since a non-admin force-rescan path would be a DoS
+    /// amplifier (the pre-existing `force=true` was naturally rate-limited
+    /// by dedup; `bypass_dedup` removes that safety).
     #[serde(default)]
     pub bypass_dedup: Option<bool>,
 }
@@ -551,13 +558,14 @@ async fn list_scan_configs(
     responses(
         (status = 200, description = "Scan triggered successfully", body = TriggerScanResponse),
         (status = 400, description = "Validation error", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "bypass_dedup requested by non-admin caller", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "Scanner service not configured", body = crate::api::openapi::ErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 async fn trigger_scan(
     State(state): State<SharedState>,
-    Extension(_auth): Extension<AuthExtension>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<TriggerScanRequest>,
 ) -> Result<Json<TriggerScanResponse>> {
     // 503 (not 500) because "scanner not configured" is a normal operational
@@ -570,6 +578,20 @@ async fn trigger_scan(
         .clone();
 
     let bypass_dedup = body.bypass_dedup.unwrap_or(false);
+
+    // `bypass_dedup = true` skips the hash-based scan dedup short-circuit and
+    // fans out a fresh scanner run per artifact (and, at the repo level, one
+    // tokio::spawn worker per artifact in the repo). The pre-existing
+    // `force = true` path was naturally rate-limited because dedup would
+    // collapse repeated calls against the same checksum into a single cached
+    // result; `bypass_dedup` removes that safety. Gating on admin scope
+    // matches the inventory-backfill path in admin.rs which also touches
+    // every artifact in a repository (see issue #1469 review feedback).
+    if bypass_dedup && !auth.is_admin {
+        return Err(AppError::Authorization(
+            "bypass_dedup requires admin privileges".to_string(),
+        ));
+    }
 
     if let Some(artifact_id) = body.artifact_id {
         // Pre-allocate one scan_result row per configured scanner so the IDs
@@ -1761,6 +1783,71 @@ mod tests {
             "trigger_scan must return AppError::ServiceUnavailable(\"Scanner \
              service not configured\") when state.scanner_service is None, \
              so the response is HTTP 503 (not 500).",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: bypass_dedup must be admin-gated in trigger_scan.
+    //
+    // PR #1514 review feedback: `bypass_dedup` skips the hash-based scan
+    // dedup short-circuit and fans out unbounded tokio::spawn workers across
+    // an entire repository's artifacts. The pre-existing `force = true` path
+    // was naturally rate-limited because dedup collapsed repeated calls
+    // against the same checksum into a single cached result; `bypass_dedup`
+    // removes that safety, so a non-admin caller setting it to true would be
+    // a DoS amplifier.
+    //
+    // A full handler invocation would require a live Postgres pool (this
+    // file uses no #[sqlx::test] fixtures); we follow the same source-grep
+    // pattern used for the #918 regression above so a refactor that drops
+    // the admin check still trips this test.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_trigger_scan_handler_admin_gates_bypass_dedup() {
+        let src = include_str!("security.rs");
+
+        let fn_marker = "async fn trigger_scan(";
+        let fn_start = src
+            .find(fn_marker)
+            .expect("trigger_scan function must exist");
+        let next_fn_marker = "async fn list_scans(";
+        let fn_end_rel = src[fn_start..]
+            .find(next_fn_marker)
+            .expect("list_scans must follow trigger_scan in this file");
+        let body = &src[fn_start..fn_start + fn_end_rel];
+
+        // The handler must bind the auth extension by a real name (not `_auth`).
+        // `Extension(_auth)` would discard the value and make the admin check
+        // impossible.
+        assert!(
+            !body.contains("Extension(_auth)"),
+            "trigger_scan must not discard the AuthExtension via `_auth`; \
+             bind it as `Extension(auth)` so the admin check can run.",
+        );
+        assert!(
+            body.contains("Extension(auth)"),
+            "trigger_scan must bind the AuthExtension as `auth` so the \
+             admin check can run.",
+        );
+
+        // The handler must short-circuit on `bypass_dedup && !auth.is_admin`
+        // with AppError::Authorization (mapped to HTTP 403). Spelled in two
+        // pieces so this assertion's own text does not trivially satisfy the
+        // search.
+        let admin_check = format!("bypass_dedup && !auth.{}", "is_admin");
+        assert!(
+            body.contains(&admin_check),
+            "trigger_scan must gate `bypass_dedup = true` on `auth.is_admin`. \
+             Non-admin callers setting bypass_dedup bypass the dedup safety \
+             and fan out unbounded scanner work (DoS amplifier). See PR \
+             #1514 review feedback.",
+        );
+
+        let forbidden_variant = format!("AppError::{}(", "Authorization");
+        assert!(
+            body.contains(&forbidden_variant),
+            "trigger_scan must reject non-admin bypass_dedup with \
+             AppError::Authorization (HTTP 403).",
         );
     }
 
