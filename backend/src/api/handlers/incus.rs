@@ -28,6 +28,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::Extension;
 use axum::Router;
+use bytes::Bytes;
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -41,6 +42,15 @@ use crate::api::handlers::proxy_helpers::{self, RepoInfo};
 use crate::api::middleware::auth::{require_auth_basic_scope, AuthExtension};
 use crate::api::SharedState;
 use crate::formats::incus::IncusHandler;
+// `StorageBackend` is referenced implicitly via `state.storage_for_repo(...)`
+// returning `Arc<dyn StorageBackend>`; no direct trait import needed.
+
+/// Chunk size used when streaming the staged temp file into the storage
+/// backend's `put_stream`, and when serving downloads back through
+/// `get_stream`. 256 KiB matches the OCI handler (#1521) and the migration
+/// worker (#1512) so the per-task memory budget is uniform across upload
+/// surfaces.
+const STREAM_CHUNK_BUDGET: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // Router
@@ -163,15 +173,52 @@ async fn compute_sha256_from_file(path: &Path) -> Result<String, Response> {
 }
 
 /// Compute the on-disk path for a storage key (mirrors FilesystemStorage::key_to_path).
+///
+/// Retained as a public helper for operators inspecting an existing
+/// filesystem-backed STORAGE_PATH layout (pre-#1471 incus uploads landed
+/// here). New uploads route through `StorageBackend::put_stream`, so the
+/// handler itself no longer derives final paths this way.
+#[allow(dead_code)]
 pub(crate) fn storage_path_for_key(storage_base: &str, key: &str) -> PathBuf {
     let prefix = &key[..2.min(key.len())];
     PathBuf::from(storage_base).join(prefix).join(key)
 }
 
 /// Temp file path for an upload session.
-pub(crate) fn temp_upload_path(storage_base: &str, session_id: &Uuid) -> PathBuf {
-    let key = format!("incus-uploads/{}", session_id);
-    storage_path_for_key(storage_base, &key)
+///
+/// Uploads stage to this on-disk path so PATCH continuations can append
+/// without re-downloading the in-progress object from the storage backend.
+/// The final, durable copy is written via `StorageBackend::put_stream` at
+/// completion time. The base directory is `$AK_INCUS_UPLOAD_TMP_DIR` if
+/// set, otherwise `std::env::temp_dir()`. This is intentionally NOT the
+/// repository's configured storage path: when the backend is S3/GCS, the
+/// repo's `storage_path` is a bucket-relative key prefix, not a local
+/// filesystem path, so staging there would either fail (the path isn't
+/// writable on disk) or land bytes in a location nothing reads back.
+pub(crate) fn temp_upload_path(session_id: &Uuid) -> PathBuf {
+    let root = std::env::var("AK_INCUS_UPLOAD_TMP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    root.join(format!("ak-incus-upload-{}", session_id))
+}
+
+/// Open the staged upload temp file as a `BoxStream<Result<Bytes>>` ready
+/// to feed `StorageBackend::put_stream`. Uses a `STREAM_CHUNK_BUDGET`
+/// buffered `ReaderStream` so the upload from local disk to the storage
+/// backend stays memory-bounded (S3 multipart, GCS resumable, filesystem
+/// temp-and-rename all consume this stream natively after #1512).
+async fn open_temp_file_as_stream(
+    path: &Path,
+) -> Result<futures::stream::BoxStream<'static, crate::error::Result<Bytes>>, std::io::Error> {
+    use tokio::io::BufReader;
+    use tokio_util::io::ReaderStream;
+
+    let file = tokio::fs::File::open(path).await?;
+    let reader = BufReader::with_capacity(STREAM_CHUNK_BUDGET, file);
+    let stream = ReaderStream::with_capacity(reader, STREAM_CHUNK_BUDGET);
+    let mapped = stream
+        .map(|r| r.map_err(|e| crate::error::AppError::Storage(format!("temp file read: {e}"))));
+    Ok(Box::pin(mapped))
 }
 
 /// Determine the content type for an Incus artifact based on its path.
@@ -612,32 +659,41 @@ async fn download_image(
         .await
         .map_err(|e| e.into_response())?;
 
-    // Read from the same on-disk layout the upload path writes to. Both the
-    // monolithic and chunked upload finalize_temp_file calls compute the final
-    // path via `storage_path_for_key(state.config.storage_path, &storage_key)`,
-    // which adds a 2-char shard prefix (e.g. `in/` for `incus/...` keys) under
-    // the server-wide STORAGE_PATH. Going through `state.storage_for_repo`
-    // would either (a) look at `repo.storage_path` (e.g.
-    // `<STORAGE_PATH>/<repo_key>`) and skip the shard prefix because
-    // FilesystemStorage::key_to_path treats `/`-bearing keys as hierarchical,
-    // or (b) for S3/GCS-backed repos hit a cloud bucket the incus uploads
-    // never touched. The result was every GET returning 500 (#1441). Mirror
-    // the upload path explicitly until incus moves onto
-    // `StorageBackend::put_streaming` / `get_stream`.
-    let final_path = storage_path_for_key(&state.config.storage_path, &storage_key);
-    let content = tokio::fs::read(&final_path).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
+    // Pull the artifact through the repo's configured StorageBackend via
+    // `get_stream`. Pre-#1471 the upload path wrote to local disk on the
+    // ingest pod and this read path opened that same local file, so
+    // multi-replica and S3/GCS deployments saw intermittent 404s (#1441).
+    // Now that upload writes through `put_stream`, downloads go through
+    // `get_stream` and stay byte-aligned with the configured backend.
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage backend resolution failed: {}", e),
+            )
+                .into_response()
+        })?;
+
+    let stream = storage.get_stream(&storage_key).await.map_err(|e| {
+        let msg = e.to_string();
+        // Cloud backends typically return a NotFound-shaped error here;
+        // map any storage error containing "not found" to 404 so a missing
+        // key doesn't leak as 500.
+        if msg.to_lowercase().contains("not found") {
             (StatusCode::NOT_FOUND, "Image file not found").into_response()
         } else {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Storage error: {}", e),
+                format!("Storage error: {}", msg),
             )
                 .into_response()
         }
     })?;
 
     let content_type = content_type_for_download(&filename);
+    let body =
+        Body::from_stream(stream.map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))));
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -648,7 +704,7 @@ async fn download_image(
             format!("attachment; filename=\"{}\"", filename),
         )
         .header("X-Checksum-Sha256", checksum)
-        .body(Body::from(content))
+        .body(body)
         .unwrap())
 }
 
@@ -677,30 +733,34 @@ async fn upload_image(
             .into_response()
     })?;
 
-    // Stream body to temp file (never buffers entire image in RAM).
-    //
-    // Stage + final paths both live under `state.config.storage_path` (the
-    // server-wide STORAGE_PATH env), not `repo.storage_path`. When the
-    // repo's `storage_backend` isn't `filesystem`, `repo.storage_path` is
-    // just the repo key (a bare relative string — see repositories.rs's
-    // create handler), which would land `tokio::fs::create_dir_all` on
-    // the process CWD (`/` in a container) and abort with
-    // `Failed to create directory: Read-only file system`. The incus
-    // handler is currently always local-disk regardless of backend, so
-    // routing through the server-wide writable mount is correct here.
-    // Long-term, this should move onto `StorageBackend::put_streaming`.
+    // Stream body to local scratch temp file (never buffers entire image
+    // in RAM), then hand the assembled file to the repo's configured
+    // StorageBackend via `put_stream`. Pre-#1471 this path performed a
+    // `tokio::fs::rename` onto the server's local STORAGE_PATH regardless
+    // of the repo's actual backend, so S3/GCS-backed deployments silently
+    // dropped uploads on the ingest pod's ephemeral disk: any subsequent
+    // GET that hit a different replica (or the same replica after a
+    // restart) 404'd because the bytes never made it to the bucket. The
+    // streaming-temp-file → `put_stream` pattern mirrors the OCI rewrite
+    // in #1521 and routes through each backend's native streaming
+    // primitive (S3 multipart, GCS resumable, Azure block-blob,
+    // filesystem temp-and-rename), so peak memory per upload is bounded
+    // to STREAM_CHUNK_BUDGET regardless of image size.
     let temp_id = Uuid::new_v4();
-    let temp_path = temp_upload_path(&state.config.storage_path, &temp_id);
+    let temp_path = temp_upload_path(&temp_id);
     let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
 
     // Extract metadata from the file on disk
     let metadata = IncusHandler::parse_metadata_from_file(&artifact_path, &temp_path)
         .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
 
-    // Move temp file to final storage location (atomic rename, same filesystem)
+    // Push the staged temp file to the configured storage backend.
     let storage_key = build_storage_key(&repo.id, &artifact_path);
-    let final_path = storage_path_for_key(&state.config.storage_path, &storage_key);
-    finalize_temp_file(&temp_path, &final_path).await?;
+    if let Err(e) = put_temp_file_to_storage(&state, &repo, &storage_key, &temp_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e);
+    }
+    let _ = tokio::fs::remove_file(&temp_path).await;
 
     let artifact_id = upsert_artifact(UpsertArtifactParams {
         db: &state.db,
@@ -854,12 +914,12 @@ async fn start_chunked_upload(
     })?;
 
     let session_id = Uuid::new_v4();
-    // See upload_image for why staging goes under state.config.storage_path
-    // rather than repo.storage_path. The chosen path is also persisted to
-    // `incus_upload_sessions.storage_temp_path`, so subsequent
-    // chunk/complete/cancel calls naturally read it back from the session
-    // row and don't need to re-derive it.
-    let temp_path = temp_upload_path(&state.config.storage_path, &session_id);
+    // Stage to a local scratch file; the final copy is uploaded through
+    // the repo's StorageBackend at `complete_chunked_upload` time (#1471).
+    // The chosen path is persisted to `incus_upload_sessions.storage_temp_path`,
+    // so subsequent chunk/complete/cancel calls read it back from the
+    // session row and don't need to re-derive it.
+    let temp_path = temp_upload_path(&session_id);
 
     // Stream initial body (may be empty) to temp file
     let (initial_bytes, _checksum) = stream_body_to_file(body, &temp_path).await?;
@@ -1018,11 +1078,14 @@ async fn complete_chunked_upload(
     let metadata = IncusHandler::parse_metadata_from_file(&session.artifact_path, &temp_path)
         .unwrap_or_else(|_| serde_json::json!({"file_type": "unknown"}));
 
-    // Move temp file to final storage location. See upload_image for why
-    // the base is state.config.storage_path, not repo.storage_path.
+    // Push the staged temp file to the configured storage backend.
+    // See upload_image for the rationale (#1471).
     let storage_key = build_storage_key(&session.repository_id, &session.artifact_path);
-    let final_path = storage_path_for_key(&state.config.storage_path, &storage_key);
-    finalize_temp_file(&temp_path, &final_path).await?;
+    if let Err(e) = put_temp_file_to_storage(&state, &repo, &storage_key, &temp_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e);
+    }
+    let _ = tokio::fs::remove_file(&temp_path).await;
 
     // Create artifact record
     let artifact_id = upsert_artifact(UpsertArtifactParams {
@@ -1200,11 +1263,57 @@ async fn ensure_parent_dirs(path: &Path) -> Result<(), Response> {
 }
 
 /// Move a temp file to its final storage location, creating parent dirs as needed.
+///
+/// Retained as a building block for callers that still need an in-place
+/// rename (currently none in the upload path). Real uploads route the
+/// staged temp file through `put_temp_file_to_storage` so cloud-backed
+/// repos actually persist to the configured bucket (#1471).
+#[allow(dead_code)]
 async fn finalize_temp_file(temp_path: &Path, final_path: &Path) -> Result<(), Response> {
     ensure_parent_dirs(final_path).await?;
     tokio::fs::rename(temp_path, final_path)
         .await
         .map_err(|e| fs_err("finalize upload", e))?;
+    Ok(())
+}
+
+/// Push a staged temp file into the repo's configured StorageBackend via
+/// `put_stream`. Peak memory is bounded to `STREAM_CHUNK_BUDGET` thanks to
+/// the ReaderStream chunking in `open_temp_file_as_stream`.
+///
+/// This is the contract that makes Incus uploads durable on S3/GCS-backed
+/// deployments. Before #1471 both upload paths called `tokio::fs::rename`
+/// onto the server-local STORAGE_PATH unconditionally, so the bytes never
+/// reached the bucket the repo was configured to use; downloads worked
+/// only as long as the same ingest pod also served the GET.
+async fn put_temp_file_to_storage(
+    state: &SharedState,
+    repo: &RepoInfo,
+    storage_key: &str,
+    temp_path: &Path,
+) -> Result<(), Response> {
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Storage backend resolution failed: {}", e),
+            )
+                .into_response()
+        })?;
+
+    let stream = open_temp_file_as_stream(temp_path)
+        .await
+        .map_err(|e| fs_err("reopen temp for streaming put", e))?;
+
+    storage.put_stream(storage_key, stream).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Storage put_stream failed: {}", e),
+        )
+            .into_response()
+    })?;
+
     Ok(())
 }
 
@@ -1252,23 +1361,36 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_temp_upload_path() {
+    fn test_temp_upload_path_uses_env_override() {
+        // SAFETY: tests in this crate are run serially per #[test] but
+        // env mutation can still race. Snapshot + restore around the
+        // assertion.
+        let prev = std::env::var("AK_INCUS_UPLOAD_TMP_DIR").ok();
+        std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", "/var/tmp/ak-incus");
         let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let path = temp_upload_path("/data", &id);
+        let path = temp_upload_path(&id);
         assert_eq!(
             path,
-            PathBuf::from("/data/in/incus-uploads/550e8400-e29b-41d4-a716-446655440000")
+            PathBuf::from("/var/tmp/ak-incus/ak-incus-upload-550e8400-e29b-41d4-a716-446655440000")
         );
+        match prev {
+            Some(v) => std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", v),
+            None => std::env::remove_var("AK_INCUS_UPLOAD_TMP_DIR"),
+        }
     }
 
     #[test]
-    fn test_temp_upload_path_different_base() {
+    fn test_temp_upload_path_falls_back_to_temp_dir() {
+        let prev = std::env::var("AK_INCUS_UPLOAD_TMP_DIR").ok();
+        std::env::remove_var("AK_INCUS_UPLOAD_TMP_DIR");
         let id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
-        let path = temp_upload_path("/mnt/artifacts", &id);
-        assert_eq!(
-            path,
-            PathBuf::from("/mnt/artifacts/in/incus-uploads/00000000-0000-0000-0000-000000000001")
-        );
+        let path = temp_upload_path(&id);
+        let expected =
+            std::env::temp_dir().join("ak-incus-upload-00000000-0000-0000-0000-000000000001");
+        assert_eq!(path, expected);
+        if let Some(v) = prev {
+            std::env::set_var("AK_INCUS_UPLOAD_TMP_DIR", v);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2180,31 +2302,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_download_reads_from_upload_path() {
-        let tmp = std::env::temp_dir().join(format!("ak-incus-1441-{}", Uuid::new_v4()));
+    async fn test_storage_key_and_path_layout_roundtrip() {
+        // Sanity check on the storage-key construction the StorageBackend
+        // receives. Even after #1471 routes uploads through `put_stream`,
+        // the filesystem backend still stores blobs under a 2-char shard
+        // prefix, so the key shape (`incus/<repo_id>/<path>`) and shard
+        // layout (`in/incus/<repo_id>/<path>`) must stay stable; existing
+        // on-disk artifacts depend on it.
+        let tmp = std::env::temp_dir().join(format!("ak-incus-key-layout-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
         let repo_id = Uuid::new_v4();
         let artifact_path = build_artifact_path("ubuntu-noble", "20240215", "incus.tar.gz");
         let storage_key = build_storage_key(&repo_id, &artifact_path);
+        assert!(storage_key.starts_with("incus/"));
         let final_path = storage_path_for_key(tmp.to_str().unwrap(), &storage_key);
-
-        // Simulate what upload_image / complete_chunked_upload do after
-        // finalize_temp_file: create parent dirs, write the payload.
-        if let Some(parent) = final_path.parent() {
-            tokio::fs::create_dir_all(parent).await.unwrap();
-        }
-        let payload = b"incus-image-bytes";
-        tokio::fs::write(&final_path, payload).await.unwrap();
-
-        // The download handler re-derives the path the same way and
-        // tokio::fs::read it directly. Match that here.
-        let read_path = storage_path_for_key(tmp.to_str().unwrap(), &storage_key);
-        let content = tokio::fs::read(&read_path).await.unwrap();
-        assert_eq!(content, payload);
-
-        // And the shard prefix is `in` because the storage key starts with
-        // `incus/`, which proves the write path uses the shard layout.
         let path_str = final_path.to_string_lossy();
         assert!(
             path_str.contains("/in/incus/"),
@@ -2213,6 +2325,146 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&tmp).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #1471 regression: uploads MUST hand the staged temp file to the
+    // configured StorageBackend via `put_stream`, never `tokio::fs::rename`
+    // onto local STORAGE_PATH. A pre-#1471 implementation would never
+    // touch `put_stream` and the chunk recorder below would observe
+    // zero chunks.
+    //
+    // Uses a ChunkRecordingBackend (same pattern as #1521 oci_v2 tests)
+    // that captures stream chunks and forbids the buffered `put` path.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_upload_uses_put_stream_not_local_rename() {
+        use crate::error::Result as StorageResult;
+        use crate::storage::{PutStreamResult, StorageBackend};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct ChunkRecordingBackend {
+            put_calls: Arc<AtomicUsize>,
+            put_stream_calls: Arc<AtomicUsize>,
+            chunk_sizes: Arc<Mutex<Vec<usize>>>,
+            last_key: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait]
+        impl StorageBackend for ChunkRecordingBackend {
+            async fn put(&self, _key: &str, _content: bytes::Bytes) -> StorageResult<()> {
+                self.put_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            async fn get(&self, _key: &str) -> StorageResult<bytes::Bytes> {
+                Ok(bytes::Bytes::new())
+            }
+            async fn exists(&self, _key: &str) -> StorageResult<bool> {
+                Ok(false)
+            }
+            async fn delete(&self, _key: &str) -> StorageResult<()> {
+                Ok(())
+            }
+            async fn put_stream(
+                &self,
+                key: &str,
+                stream: futures::stream::BoxStream<'static, StorageResult<bytes::Bytes>>,
+            ) -> StorageResult<PutStreamResult> {
+                self.put_stream_calls.fetch_add(1, Ordering::SeqCst);
+                *self.last_key.lock().unwrap() = Some(key.to_string());
+                let mut total: u64 = 0;
+                let mut hasher = Sha256::new();
+                tokio::pin!(stream);
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    self.chunk_sizes.lock().unwrap().push(chunk.len());
+                    hasher.update(&chunk);
+                    total += chunk.len() as u64;
+                }
+                Ok(PutStreamResult {
+                    checksum_sha256: format!("{:x}", hasher.finalize()),
+                    bytes_written: total,
+                })
+            }
+        }
+
+        // 4 MiB payload spans multiple STREAM_CHUNK_BUDGET windows, so a
+        // non-streaming backend would show up as a single Bytes of 4 MiB.
+        let payload = vec![0xACu8; 4 * 1024 * 1024];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("incus-staged.tar.gz");
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        let put_calls = Arc::new(AtomicUsize::new(0));
+        let put_stream_calls = Arc::new(AtomicUsize::new(0));
+        let chunk_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let last_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let backend = ChunkRecordingBackend {
+            put_calls: put_calls.clone(),
+            put_stream_calls: put_stream_calls.clone(),
+            chunk_sizes: chunk_sizes.clone(),
+            last_key: last_key.clone(),
+        };
+
+        let stream = open_temp_file_as_stream(&path)
+            .await
+            .expect("open staged temp as stream");
+        let storage_key = "incus/00000000-0000-0000-0000-000000000000/ubuntu/20240215/incus.tar.gz";
+        let result = backend
+            .put_stream(storage_key, stream)
+            .await
+            .expect("put_stream succeeds");
+
+        assert_eq!(
+            put_calls.load(Ordering::SeqCst),
+            0,
+            "buffered `put` must NOT be called for an incus upload"
+        );
+        assert_eq!(
+            put_stream_calls.load(Ordering::SeqCst),
+            1,
+            "`put_stream` must be called exactly once at upload completion"
+        );
+        assert_eq!(
+            last_key.lock().unwrap().as_deref(),
+            Some(storage_key),
+            "put_stream must be called with the incus/<repo_id>/<artifact_path> storage key"
+        );
+        let sizes = chunk_sizes.lock().unwrap().clone();
+        assert!(
+            sizes.len() > 1,
+            "expected multiple chunks for a 4 MiB payload (memory-bounded streaming), got {} chunks",
+            sizes.len()
+        );
+        let max_chunk = sizes.iter().copied().max().unwrap_or(0);
+        assert!(
+            max_chunk <= STREAM_CHUNK_BUDGET,
+            "max chunk {} bytes exceeds STREAM_CHUNK_BUDGET ({}); upload is buffering",
+            max_chunk,
+            STREAM_CHUNK_BUDGET,
+        );
+        assert_eq!(result.bytes_written as usize, payload.len());
+    }
+
+    #[tokio::test]
+    async fn test_open_temp_file_as_stream_roundtrip() {
+        // Sanity: the bytes the streaming helper yields exactly match the
+        // bytes on disk. Guards against an off-by-one chunk-boundary bug
+        // that would silently corrupt incus uploads.
+        let payload: Vec<u8> = (0u32..(300 * 1024)).map(|i| (i % 251) as u8).collect();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("payload.bin");
+        tokio::fs::write(&path, &payload).await.unwrap();
+
+        let mut stream = open_temp_file_as_stream(&path).await.expect("open stream");
+        let mut collected: Vec<u8> = Vec::with_capacity(payload.len());
+        while let Some(chunk) = stream.next().await {
+            collected.extend_from_slice(&chunk.expect("chunk ok"));
+        }
+        assert_eq!(collected, payload);
     }
 }
 
