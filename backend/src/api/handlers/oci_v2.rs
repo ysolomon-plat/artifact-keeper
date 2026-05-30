@@ -7988,7 +7988,6 @@ mod proxy_manifest_artifact_indexing_tests {
     /// "No image tags found". This test reproduces the listing query and
     /// asserts the human-readable tag is returned.
     #[tokio::test]
-    #[ignore]
     async fn cache_manifest_appears_in_docker_tag_listing() {
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -8081,7 +8080,6 @@ mod proxy_manifest_artifact_indexing_tests {
     /// deletes per-architecture child manifests and the UI's multi-arch
     /// size accounting under-reports by orders of magnitude (#1357 review).
     #[tokio::test]
-    #[ignore]
     async fn cache_manifest_records_refs_for_index_manifest() {
         let Some(pool) = tdh::try_pool().await else {
             return;
@@ -8170,6 +8168,280 @@ mod proxy_manifest_artifact_indexing_tests {
             refs.iter().any(|(_, c)| c
                 == "sha256:2222222222222222222222222222222222222222222222222222222222222222"),
             "arm64 child digest must be recorded"
+        );
+    }
+
+    /// Local repos do not get the parallel tag-keyed oci_tags row -- the
+    /// `cached_reference == reference` branch in `cached_manifest_reference_key`
+    /// returns the original reference, so the digest-keyed insert IS the
+    /// tag-keyed insert. The `repo.repo_type == Remote` guard on both the
+    /// second oci_tags upsert and the second artifacts upsert must skip,
+    /// leaving exactly one row in each table for a local-repo push-equivalent
+    /// flow.
+    #[tokio::test]
+    async fn cache_manifest_local_repo_writes_single_pair() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/alpine";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Local.as_str().to_string(),
+            upstream_url: None,
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+        );
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "v1.0",
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed for local repo");
+
+        let tag_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .fetch_one(&pool)
+        .await
+        .expect("count oci_tags");
+
+        let art_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND name LIKE $2",
+        )
+        .bind(repo_id)
+        .bind(format!("{}:%", image))
+        .fetch_one(&pool)
+        .await
+        .expect("count artifacts");
+
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            tag_count, 1,
+            "local repo must produce exactly one oci_tags row (the parallel \
+             tag-keyed insert is guarded on repo_type == Remote)"
+        );
+        assert_eq!(
+            art_count, 1,
+            "local repo must produce exactly one artifacts row (the second \
+             artifact_paths entry is guarded on repo_type == Remote)"
+        );
+    }
+
+    /// Remote-by-digest pulls (`docker pull repo@sha256:...`) hit the
+    /// `is_digest_reference(reference)` short-circuit on BOTH the parallel
+    /// oci_tags upsert AND the second artifacts upsert. The result is the
+    /// same shape as a local push: one oci_tags row + one artifacts row,
+    /// both keyed by the digest. This pins the by-digest branch so a future
+    /// refactor cannot accidentally double-insert under the tag path for a
+    /// digest reference (which would clutter the docker tag UI with a
+    /// `sha256:...` "tag" the `POSITION(':' IN t.tag) = 0` filter is
+    /// expressly designed to hide).
+    #[tokio::test]
+    async fn cache_manifest_remote_by_digest_writes_single_pair() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/busybox";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#,
+        );
+        // Caller supplies a digest reference, NOT a human-readable tag.
+        let digest_ref = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(
+            is_digest_reference(digest_ref),
+            "test fixture must use a value that is_digest_reference recognises"
+        );
+
+        let _ = cache_manifest_reference_locally(
+            &state,
+            &info,
+            digest_ref,
+            &body,
+            Some("application/vnd.oci.image.manifest.v1+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed for remote-by-digest");
+
+        let tag_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_tags WHERE repository_id = $1 AND name = $2",
+        )
+        .bind(repo_id)
+        .bind(image)
+        .fetch_one(&pool)
+        .await
+        .expect("count oci_tags");
+
+        let art_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND name LIKE $2",
+        )
+        .bind(repo_id)
+        .bind(format!("{}:%", image))
+        .fetch_one(&pool)
+        .await
+        .expect("count artifacts");
+
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            tag_count, 1,
+            "remote-by-digest must produce exactly one oci_tags row (the \
+             parallel tag-keyed insert is skipped when reference is a digest)"
+        );
+        assert_eq!(
+            art_count, 1,
+            "remote-by-digest must produce exactly one artifacts row (the \
+             second artifact_paths entry is skipped when reference is a digest)"
+        );
+    }
+
+    /// Non-index content types (regular image manifests, including the
+    /// docker v2 schema and OCI image-manifest) must NOT trigger the
+    /// `record_oci_manifest_refs` call. The push path only records
+    /// parent->child edges for image-index manifests; the proxy path must
+    /// mirror that. Without this guard the function would parse a non-index
+    /// manifest as JSON looking for a `manifests` array, find nothing, and
+    /// silently no-op, but the cost (extra DB roundtrip per pull) would be
+    /// real.
+    #[tokio::test]
+    async fn cache_manifest_non_index_does_not_write_manifest_refs() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "remote", "docker").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+
+        let image = "library/curl";
+        let info = OciRepoInfo {
+            id: repo_id,
+            key: repo_key,
+            location: crate::storage::StorageLocation {
+                backend: "filesystem".to_string(),
+                path: storage_dir.to_string_lossy().to_string(),
+            },
+            repo_type: RepositoryType::Remote.as_str().to_string(),
+            upstream_url: Some("https://registry-1.docker.io".to_string()),
+            is_public: false,
+            image: image.to_string(),
+        };
+
+        // A regular image manifest body (NOT an index). Even if this body
+        // contained a `manifests` array, the content_type guard
+        // `is_index_content_type(&manifest_content_type)` must short-circuit
+        // before the parse + insert.
+        let body = Bytes::from_static(
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"size":7,"digest":"sha256:aa"},"layers":[]}"#,
+        );
+        let parent_digest = cache_manifest_reference_locally(
+            &state,
+            &info,
+            "1.0",
+            &body,
+            Some("application/vnd.docker.distribution.manifest.v2+json"),
+        )
+        .await
+        .expect("cache_manifest_reference_locally must succeed for image manifest");
+
+        let refs_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_manifest_refs WHERE repository_id = $1 AND parent_digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&parent_digest)
+        .fetch_one(&pool)
+        .await
+        .expect("count oci_manifest_refs");
+
+        let _ = sqlx::query("DELETE FROM oci_manifest_refs WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM oci_tags WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+
+        assert_eq!(
+            refs_count, 0,
+            "non-index content types must NOT write to oci_manifest_refs; \
+             the is_index_content_type guard must short-circuit before \
+             record_oci_manifest_refs is called"
         );
     }
 }
