@@ -102,6 +102,14 @@ pub fn router() -> Router<SharedState> {
         .route("/cve/history/by-cve/:cve_id", get(get_cve_history_by_cve))
         .route("/cve/history/:id", get(get_cve_history))
         .route("/cve/status/:id", post(update_cve_status))
+        // #1426: synth-id rows returned by the Security tab don't exist in
+        // `cve_history`; this route lets clients update CVE status by the
+        // only stable key a synth row carries -- (artifact_id, cve_id) --
+        // which the handler maps onto the underlying `scan_findings` rows.
+        .route(
+            "/cve/status/by-artifact/:artifact_id/by-cve/:cve_id",
+            post(update_cve_status_by_artifact_cve),
+        )
         .route("/cve/trends", get(get_cve_trends))
         // License policies
         .route(
@@ -1003,6 +1011,68 @@ async fn update_cve_status(
     Ok(Json(entry))
 }
 
+/// Update CVE status for a synth (scan_findings-derived) Security tab row.
+///
+/// Background (#1426): the Security tab read path projects `scan_findings`
+/// into `CveHistoryEntry` rows whose `id` is a deterministic SHA-256 hash
+/// (see `synth_cve_id`). Those ids have no corresponding row in the
+/// `cve_history` table, so calls to `POST /cve/status/{id}` always 404 -- a
+/// dead acknowledge path. This route operates on the only stable identity a
+/// synth row carries, the (artifact_id, cve_id) pair, and writes the
+/// underlying `scan_findings` rows instead.
+///
+/// The wider design choice between (A) populating `cve_history` from the
+/// scanner loop and (B) treating `scan_findings` as the source of truth for
+/// the Security tab is settled here in favour of B: less code, less risk of
+/// data drift between two parallel tables, and `cve_history` remains in
+/// place for the rare curated/admin write path via the legacy
+/// `POST /cve/status/{id}` route.
+#[utoipa::path(
+    post,
+    path = "/cve/status/by-artifact/{artifact_id}/by-cve/{cve_id}",
+    context_path = "/api/v1/sbom",
+    tag = "sbom",
+    params(
+        ("artifact_id" = Uuid, Path, description = "Artifact UUID"),
+        ("cve_id" = String, Path, description = "CVE identifier (e.g. CVE-2019-10744)")
+    ),
+    request_body = UpdateCveStatusRequest,
+    responses(
+        (status = 200, description = "Updated synth CVE entry", body = crate::models::sbom::CveHistoryEntry),
+        (status = 400, description = "Validation error (e.g. invalid CVE id or unsupported status)", body = crate::api::openapi::ErrorResponse),
+        (status = 403, description = "Caller does not have access to this artifact's repository"),
+        (status = 404, description = "No scan_findings rows match (artifact_id, cve_id)"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_cve_status_by_artifact_cve(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Path((artifact_id, cve_id)): Path<(Uuid, String)>,
+    Json(body): Json<UpdateCveStatusRequest>,
+) -> Result<Json<crate::models::sbom::CveHistoryEntry>> {
+    if !is_valid_vuln_id(&cve_id) {
+        return Err(AppError::Validation(invalid_cve_id_route_message(&cve_id)));
+    }
+    ensure_artifact_repo_access(&state.db, &auth, artifact_id).await?;
+    let service = SbomService::new(state.db.clone());
+    let status = CveStatus::parse(&body.status)
+        .ok_or_else(|| AppError::Validation(format!("Unknown status: {}", body.status)))?;
+    let cve_id_upper = cve_id.trim().to_ascii_uppercase();
+
+    let entry = service
+        .update_cve_status_by_artifact_cve(
+            artifact_id,
+            &cve_id_upper,
+            status,
+            Some(auth.user_id),
+            body.reason.as_deref(),
+        )
+        .await?;
+
+    Ok(Json(entry))
+}
+
 /// Get CVE trends and statistics
 #[utoipa::path(
     get,
@@ -1387,6 +1457,7 @@ async fn ensure_sbom_repo_access(
         get_cve_history_by_artifact,
         get_cve_history_by_cve,
         update_cve_status,
+        update_cve_status_by_artifact_cve,
         get_cve_trends,
         list_license_policies,
         get_license_policy,
@@ -2509,5 +2580,43 @@ mod tests {
             AppError::Validation(msg) => assert_eq!(msg, "Unknown status: maybe"),
             other => panic!("expected Validation to pass through, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #1426: synth-id acknowledge path.
+    //
+    // The new route `POST /cve/status/by-artifact/{artifact_id}/by-cve/{cve_id}`
+    // exists because synth ids returned by the Security tab have no row in
+    // `cve_history` and the legacy `POST /cve/status/{id}` route 404s on
+    // them. Tests below cover the pure input-validation portion of the
+    // handler (CVE id shape) so the contract is pinned without spinning up
+    // Postgres or Axum.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_update_cve_status_by_artifact_cve_rejects_malformed_cve_id() {
+        // The handler must short-circuit with a Validation error before
+        // hitting the DB if the CVE id is neither a CVE nor a GHSA id.
+        assert!(!is_valid_vuln_id("not-a-cve"));
+        assert!(!is_valid_vuln_id(""));
+        assert!(!is_valid_vuln_id("CVE-2024"));
+    }
+
+    #[test]
+    fn test_update_cve_status_by_artifact_cve_accepts_cve_and_ghsa_ids() {
+        // Both CVE-YYYY-N and GHSA-xxxx-xxxx-xxxx ids must be accepted so
+        // the Security tab can surface findings from either source.
+        assert!(is_valid_vuln_id("CVE-2019-10744"));
+        assert!(is_valid_vuln_id("GHSA-jf85-cpcp-j695"));
+    }
+
+    #[test]
+    fn test_update_cve_status_by_artifact_cve_validation_message_distinguishable() {
+        // Reuses the same wording the typed `/cve/history/by-cve/` route
+        // produces; pin that so a future split of the message doesn't
+        // silently regress the client-visible 400 body.
+        let msg = invalid_cve_id_route_message("not-a-cve");
+        assert!(msg.contains("not-a-cve"));
+        assert!(msg.contains("CVE-YYYY-N"));
     }
 }

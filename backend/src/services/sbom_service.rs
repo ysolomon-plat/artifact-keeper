@@ -149,6 +149,29 @@ pub(crate) fn status_string_from_acknowledged(all_acknowledged: bool) -> &'stati
     }
 }
 
+/// Project a `CveStatus` request onto the boolean `scan_findings.is_acknowledged`
+/// column the Security tab acknowledge path actually writes to.
+///
+/// Returns:
+///   - `Ok(Some(true))`  for `Acknowledged` and `FalsePositive` (the
+///     boolean column collapses both; the reason field carries the
+///     audit distinction).
+///   - `Ok(Some(false))` for `Open` (revoke an existing acknowledgement).
+///   - `Ok(None)`        for `Fixed`, signalling the caller that no
+///     `scan_findings` mutation is possible -- "fixed" is a curated-only
+///     lifecycle state. The handler turns this into a 400 with a clear
+///     message rather than silently coercing.
+///
+/// Pulled out of `update_cve_status_by_artifact_cve` so the mapping is
+/// unit-testable without a Postgres pool. (#1426)
+pub(crate) fn cve_status_to_acknowledge_flag(status: CveStatus) -> Option<bool> {
+    match status {
+        CveStatus::Acknowledged | CveStatus::FalsePositive => Some(true),
+        CveStatus::Open => Some(false),
+        CveStatus::Fixed => None,
+    }
+}
+
 /// Map the `all_acknowledged` flag to a typed `CveStatus` for the timeline
 /// projection in `get_cve_trends`. Mirrors `status_string_from_acknowledged`
 /// but returns the enum directly because the timeline DTO is typed.
@@ -1218,6 +1241,126 @@ impl SbomService {
         .await?;
 
         Ok(entry)
+    }
+
+    /// Update CVE status for an (artifact, cve) pair by mutating the
+    /// underlying `scan_findings` rows.
+    ///
+    /// Why this exists (#1426): the Security tab read path projects
+    /// `scan_findings` rows into synthetic `CveHistoryEntry` values whose
+    /// `id` is a hash-derived UUID with no corresponding row in
+    /// `cve_history`. The legacy acknowledge endpoint
+    /// `POST /sbom/cve/status/{id}` writes to `cve_history` only, so an
+    /// "acknowledge" click on a scan-derived row returned 404 -- the second,
+    /// unwired acknowledge path called out in the issue. This method gives
+    /// the Security tab a working acknowledge path by updating the source
+    /// table (`scan_findings`) directly, keyed on (artifact_id, cve_id)
+    /// because that is the only stable identity a synth row carries.
+    ///
+    /// `status` mapping (the four-state `cve_history.status` does not exist
+    /// on `scan_findings`; the only acknowledge column there is the
+    /// boolean `is_acknowledged`):
+    ///
+    /// - `Acknowledged` / `FalsePositive` -- set `is_acknowledged = true`,
+    ///   record `acknowledged_by` / `acknowledged_at` / `acknowledged_reason`.
+    ///   `false_positive` collapses to `acknowledged` on `scan_findings` since
+    ///   the table has no separate column; the reason field carries the
+    ///   distinction for audit.
+    /// - `Open` -- clear acknowledgement (mirror of the `revoke` endpoint).
+    /// - `Fixed` -- not supported by `scan_findings`; returns `Validation`.
+    ///   "Fixed" is only meaningful on curated `cve_history` rows.
+    ///
+    /// Returns a synthetic `CveHistoryEntry` reflecting the post-update
+    /// aggregate state (same shape the read path returns). Returns
+    /// `AppError::NotFound` when no matching `scan_findings` rows exist;
+    /// the caller turns that into 404.
+    pub async fn update_cve_status_by_artifact_cve(
+        &self,
+        artifact_id: Uuid,
+        cve_id: &str,
+        status: CveStatus,
+        user_id: Option<Uuid>,
+        reason: Option<&str>,
+    ) -> Result<CveHistoryEntry> {
+        // `scan_findings` only models a binary acknowledge state. `fixed`
+        // has no representation; refuse rather than silently coerce.
+        let acknowledge = cve_status_to_acknowledge_flag(status).ok_or_else(|| {
+            AppError::Validation(
+                "Status 'fixed' is not supported on scan-derived CVE entries; \
+                 only 'open', 'acknowledged', and 'false_positive' map to scan_findings"
+                    .to_string(),
+            )
+        })?;
+
+        // Compare CVE id case-insensitively. The schema does not constrain
+        // case on `scan_findings.cve_id`, and the synth ids the read path
+        // emits are upper-case, so we LOWER both sides.
+        let affected = if acknowledge {
+            sqlx::query(
+                r#"
+                UPDATE scan_findings
+                SET is_acknowledged = TRUE,
+                    acknowledged_by = $3,
+                    acknowledged_reason = $4,
+                    acknowledged_at = NOW()
+                WHERE artifact_id = $1
+                  AND cve_id IS NOT NULL
+                  AND LOWER(cve_id) = LOWER($2)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(cve_id)
+            .bind(user_id)
+            .bind(reason)
+            .execute(&self.db)
+            .await?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE scan_findings
+                SET is_acknowledged = FALSE,
+                    acknowledged_by = NULL,
+                    acknowledged_reason = NULL,
+                    acknowledged_at = NULL
+                WHERE artifact_id = $1
+                  AND cve_id IS NOT NULL
+                  AND LOWER(cve_id) = LOWER($2)
+                "#,
+            )
+            .bind(artifact_id)
+            .bind(cve_id)
+            .execute(&self.db)
+            .await?
+            .rows_affected()
+        };
+
+        if affected == 0 {
+            return Err(AppError::NotFound(format!(
+                "No scan_findings rows for artifact {} and CVE {}",
+                artifact_id, cve_id
+            )));
+        }
+
+        // Re-read the (now-mutated) aggregate so the response carries the
+        // same shape as the read path: synth id, aggregated severity, MIN/MAX
+        // detection timestamps, and an `all_acknowledged` flag that now
+        // reflects the just-written state.
+        let known: HashSet<String> = HashSet::new();
+        let entries = self
+            .build_cve_entries_from_scan_findings(Some(artifact_id), None, &known)
+            .await?;
+        let cve_upper = cve_id.to_ascii_uppercase();
+        entries
+            .into_iter()
+            .find(|e| e.cve_id.to_ascii_uppercase() == cve_upper)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Updated scan_findings rows but could not re-read aggregate \
+                     for artifact {} and CVE {}",
+                    artifact_id, cve_id
+                ))
+            })
     }
 
     /// Get CVE trends for a repository.
@@ -2987,6 +3130,47 @@ mod tests {
     fn test_scan_row_passes_known_filter_keeps_when_known_empty() {
         let known: HashSet<String> = HashSet::new();
         assert!(scan_row_passes_known_filter(Some("CVE-2019-10744"), &known));
+    }
+
+    // --- cve_status_to_acknowledge_flag (#1426) ----------------------------
+    //
+    // The Security tab read path projects `scan_findings` into synth
+    // `CveHistoryEntry` rows; `update_cve_status_by_artifact_cve` writes the
+    // same table back. `scan_findings` only models a binary acknowledge
+    // state, so the four-state `CveStatus` enum has to collapse onto a
+    // `bool`. These tests pin the mapping rules so a future enum-variant
+    // addition doesn't silently coerce.
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_acknowledged_is_true() {
+        assert_eq!(
+            cve_status_to_acknowledge_flag(CveStatus::Acknowledged),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_false_positive_collapses_to_true() {
+        // `scan_findings` has no separate "false positive" column. The
+        // boolean column models "the user told us to hide this"; the reason
+        // field carries the audit distinction.
+        assert_eq!(
+            cve_status_to_acknowledge_flag(CveStatus::FalsePositive),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_open_is_false() {
+        // `Open` is the revoke-acknowledgement path on the Security tab.
+        assert_eq!(cve_status_to_acknowledge_flag(CveStatus::Open), Some(false));
+    }
+
+    #[test]
+    fn test_cve_status_to_acknowledge_flag_fixed_is_none() {
+        // "Fixed" has no representation on `scan_findings`. The handler
+        // must surface a 400, not silently set is_acknowledged = true.
+        assert_eq!(cve_status_to_acknowledge_flag(CveStatus::Fixed), None);
     }
 
     // --- severity_rank / severity_from_rank --------------------------------
