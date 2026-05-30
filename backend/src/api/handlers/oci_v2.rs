@@ -2438,10 +2438,19 @@ async fn handle_patch_upload(
         }
     };
 
-    // Look up session
+    // Resolve repo from URL first, then bind it into the session lookup so a
+    // session created against repo A cannot be driven via repo B's URL
+    // (issue #1317). Same 404 shape for "no session" and "session in another
+    // repo" avoids leaking session existence across repos.
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
     let session = match sqlx::query!(
-        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1",
-        session_id
+        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+        session_id,
+        repo.id
     )
     .fetch_optional(&state.db)
     .await
@@ -2450,12 +2459,6 @@ async fn handle_patch_upload(
         Ok(None) => return oci_error(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "upload session not found"),
         Err(e) => return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &e.to_string()),
     };
-
-    let repo = match resolve_repo(&state.db, image_name).await {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    let _ = repo;
 
     // Append PATCH bytes directly to the local temp file with
     // O_APPEND. No storage-backend round trip, no full-file rewrite.
@@ -2556,9 +2559,18 @@ async fn handle_complete_upload(
         }
     };
 
+    // Resolve repo from URL first, then bind it into the session lookup so a
+    // session created against repo A cannot be completed via repo B's URL
+    // (issue #1317).
+    let repo = match resolve_repo(&state.db, image_name).await {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
     let session = match sqlx::query!(
-        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1",
-        session_id
+        "SELECT repository_id, bytes_received, storage_temp_key FROM oci_upload_sessions WHERE id = $1 AND repository_id = $2",
+        session_id,
+        repo.id
     )
     .fetch_optional(&state.db)
     .await
@@ -2578,11 +2590,6 @@ async fn handle_complete_upload(
                 &e.to_string(),
             )
         }
-    };
-
-    let repo = match resolve_repo(&state.db, image_name).await {
-        Ok(r) => r,
-        Err(e) => return e,
     };
 
     let storage = match state.storage_for_repo(&repo.location) {
@@ -8133,5 +8140,642 @@ mod token_service_query_validation_tests {
                 .unwrap_or(false),
             "filename must be prefixed with ak-oci-upload- for operator visibility"
         );
+    }
+}
+
+// ===========================================================================
+// Issue #1317 regression coverage (lib-side, picked up by the Coverage gate).
+//
+// The integration suite in `backend/tests/oci_chunked_upload_cross_repo_tests.rs`
+// is also wired into the CI integration matrix, but `cargo llvm-cov --lib`
+// excludes the `tests/` directory, so without these lib-side tests the
+// cross-repo session lookup branches in `handle_patch_upload` and
+// `handle_complete_upload` would appear uncovered to the coverage gate.
+// ===========================================================================
+
+#[cfg(test)]
+mod cross_repo_session_regression_tests {
+    use super::*;
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Insert a second docker repo and return (id, key, storage_dir). The
+    /// storage_dir is created so the handler can read/write blob temp files
+    /// under it if needed during the same-repo happy path.
+    async fn create_docker_repo(pool: &PgPool, label: &str) -> (Uuid, String, std::path::PathBuf) {
+        let id = Uuid::new_v4();
+        let key = format!("ph-test-docker-{}-{}", label, id);
+        let storage_dir = std::env::temp_dir().join(format!("ph-test-docker-{}", id));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        sqlx::query(
+            "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+             VALUES ($1, $2, $2, $3, 'local'::repository_type, 'docker'::repository_format, true)",
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(storage_dir.to_string_lossy().as_ref())
+        .execute(pool)
+        .await
+        .expect("insert docker repo");
+        (id, key, storage_dir)
+    }
+
+    /// Create a user with a real bcrypt-hashed password so the OCI Basic-auth
+    /// flow (`authenticate_oci_with_scopes`) succeeds. Returns (user_id, username, password).
+    async fn create_pushable_user(pool: &PgPool) -> (Uuid, String, String) {
+        let id = Uuid::new_v4();
+        let username = format!("oci1317-{}", id);
+        let password = "pushpass".to_string();
+        let hash = bcrypt::hash(&password, 4).expect("bcrypt hash");
+        sqlx::query(
+            r#"
+            INSERT INTO users (id, username, email, password_hash, auth_provider, is_admin, is_active)
+            VALUES ($1, $2, $3, $4, 'local', true, true)
+            "#,
+        )
+        .bind(id)
+        .bind(&username)
+        .bind(format!("{}@test.local", username))
+        .bind(&hash)
+        .execute(pool)
+        .await
+        .expect("insert user");
+        (id, username, password)
+    }
+
+    fn basic_auth(username: &str, password: &str) -> String {
+        use base64::Engine;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", username, password));
+        format!("Basic {}", encoded)
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    async fn cleanup_all(
+        pool: &PgPool,
+        repo_ids: &[Uuid],
+        user_id: Uuid,
+        storage_dirs: &[std::path::PathBuf],
+    ) {
+        for id in repo_ids {
+            let _ = sqlx::query("DELETE FROM oci_upload_sessions WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(pool)
+            .await;
+        for dir in storage_dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// PATCH chunk under repo B must be 404 (session belongs to repo A).
+    /// Same-repo PATCH must still succeed. This pins both branches of the
+    /// new session lookup in `handle_patch_upload`.
+    #[tokio::test]
+    async fn handle_patch_upload_cross_repo_rejected_and_same_repo_ok() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_a_id, key_a, storage_a) = create_docker_repo(&pool, "a").await;
+        let (repo_b_id, key_b, storage_b) = create_docker_repo(&pool, "b").await;
+        let state = tdh::build_state(pool.clone(), storage_a.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let make_app = || router().with_state(state.clone());
+
+        // POST start under repo A.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", key_a))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "POST start under repo A should return 202"
+        );
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_a_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // Cross-repo PATCH must be 404.
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/myimage/blobs/uploads/{}", key_b, session_id))
+            .header("Authorization", &auth)
+            .body(Body::from(b"attacker-chunk".to_vec()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PATCH chunk under wrong repo must be 404 (issue #1317)"
+        );
+
+        // Same-repo PATCH must still succeed (covers happy-path lookup).
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/myimage/blobs/uploads/{}", key_a, session_id))
+            .header("Authorization", &auth)
+            .body(Body::from(b"legitimate-chunk".to_vec()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "PATCH chunk under owning repo should return 202"
+        );
+
+        cleanup_all(
+            &pool,
+            &[repo_a_id, repo_b_id],
+            user_id,
+            &[storage_a, storage_b],
+        )
+        .await;
+    }
+
+    /// PUT complete under repo B must be 404 even with a valid digest query.
+    /// The legitimate session row must remain intact, and a same-repo PUT
+    /// complete with the right digest must succeed (covers happy-path
+    /// branch of the new lookup in `handle_complete_upload`).
+    #[tokio::test]
+    async fn handle_complete_upload_cross_repo_rejected_and_same_repo_ok() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_a_id, key_a, storage_a) = create_docker_repo(&pool, "a").await;
+        let (repo_b_id, key_b, storage_b) = create_docker_repo(&pool, "b").await;
+        let state = tdh::build_state(pool.clone(), storage_a.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", key_a))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_a_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // PATCH the chunk under repo A so the temp blob is non-empty.
+        let chunk = b"chunk-bytes".to_vec();
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/{}/myimage/blobs/uploads/{}", key_a, session_id))
+            .header("Authorization", &auth)
+            .body(Body::from(chunk.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let digest = format!("sha256:{}", sha256_hex(&chunk));
+
+        // Cross-repo PUT must be 404.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                key_b, session_id, digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "PUT complete under wrong repo must be 404 (issue #1317)"
+        );
+
+        // Session row must still exist (cross-repo attempts must not
+        // delete or finalize it).
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(still_there, 1, "cross-repo PUT must not delete session");
+
+        // Same-repo PUT must succeed.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                key_a, session_id, digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "PUT complete under owning repo should return 201"
+        );
+
+        cleanup_all(
+            &pool,
+            &[repo_a_id, repo_b_id],
+            user_id,
+            &[storage_a, storage_b],
+        )
+        .await;
+    }
+
+    /// PUT complete with a digest that does not match the bytes on disk
+    /// must reject with 400 DIGEST_INVALID, drop the session row, and
+    /// remove the temp file. This pins the rehash-and-compare branch of
+    /// `handle_complete_upload` plus the cleanup path (#1449 acceptance).
+    #[tokio::test]
+    async fn handle_complete_upload_digest_mismatch_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // PATCH a known chunk into the temp file.
+        let chunk = b"actual-chunk-bytes".to_vec();
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}",
+                repo_key, session_id
+            ))
+            .header("Authorization", &auth)
+            .body(Body::from(chunk.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // PUT with a digest that does NOT match the chunk on disk.
+        let bogus_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                repo_key, session_id, bogus_digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "digest mismatch must reject with 400"
+        );
+
+        // The session row should be gone (handler deletes it on mismatch).
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "session row must be deleted on digest mismatch"
+        );
+
+        // No blob row should have been recorded.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(bogus_digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            blob_rows, 0,
+            "no oci_blobs row should be written on digest mismatch"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// PUT complete without a digest query parameter must reject with
+    /// 400 DIGEST_INVALID. This pins the early-return branch of
+    /// `handle_complete_upload` before any temp-file work.
+    #[tokio::test]
+    async fn handle_complete_upload_missing_digest_query_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "nd").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // PUT without `?digest=` query.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}",
+                repo_key, session_id
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing digest query must reject with 400"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Monolithic POST?digest=... with the full blob inline must verify
+    /// the digest, write the blob under the final `oci-blobs/<digest>`
+    /// key, record `oci_blobs`, and return 201. This pins the monolithic
+    /// branch of `handle_start_upload` (#1449 acceptance).
+    #[tokio::test]
+    async fn handle_start_upload_monolithic_with_digest_creates_blob() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mono").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        let body = b"monolithic-blob-payload".to_vec();
+        let digest = format!("sha256:{}", sha256_hex(&body));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                repo_key, digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "monolithic POST with matching digest must return 201"
+        );
+
+        // oci_blobs row should be recorded under the final digest.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(blob_rows, 1, "oci_blobs row must be recorded");
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Monolithic POST?digest=... where the provided digest does NOT
+    /// match the body bytes must reject with 400 DIGEST_INVALID and not
+    /// record an oci_blobs row. This pins the pre-write verification in
+    /// `handle_start_upload`.
+    #[tokio::test]
+    async fn handle_start_upload_monolithic_digest_mismatch_rejected() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "monomm").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        let body = b"monolithic-bytes-A".to_vec();
+        // Digest of a DIFFERENT payload so verification must fail.
+        let wrong_digest = format!("sha256:{}", sha256_hex(b"some-other-bytes"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/?digest={}",
+                repo_key, wrong_digest
+            ))
+            .header("Authorization", &auth)
+            .header("Content-Type", "application/octet-stream")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "monolithic POST with mismatched digest must reject with 400"
+        );
+
+        // No oci_blobs row should have been recorded.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&wrong_digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            blob_rows, 0,
+            "no oci_blobs row should be written on digest mismatch"
+        );
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
+    }
+
+    /// Successive PATCH chunks must each be appended to the temp file
+    /// (O_APPEND) and the running `bytes_received` counter must reflect
+    /// the cumulative size. PUT complete with the digest of the
+    /// concatenated chunks must then succeed and record a single
+    /// `oci_blobs` row. This pins the multi-chunk happy path of
+    /// `handle_patch_upload` + `handle_complete_upload` together.
+    #[tokio::test]
+    async fn handle_patch_upload_multi_chunk_then_complete_succeeds() {
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username, password) = create_pushable_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = create_docker_repo(&pool, "mc").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let auth = basic_auth(&username, &password);
+        let make_app = || router().with_state(state.clone());
+
+        // POST start.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/myimage/blobs/uploads/", repo_key))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM oci_upload_sessions WHERE repository_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_one(&pool)
+        .await
+        .expect("session row exists");
+
+        // Two PATCH chunks.
+        let chunk_a = b"first-chunk-".to_vec();
+        let chunk_b = b"second-chunk".to_vec();
+        for chunk in &[&chunk_a, &chunk_b] {
+            let req = Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/{}/myimage/blobs/uploads/{}",
+                    repo_key, session_id
+                ))
+                .header("Authorization", &auth)
+                .body(Body::from((*chunk).clone()))
+                .unwrap();
+            let resp = make_app().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::ACCEPTED,
+                "PATCH chunk under owning repo should return 202"
+            );
+        }
+
+        // After two PATCHes, bytes_received must equal the sum of both
+        // chunks. Pre-#1449 the second PATCH would read+rewrite the
+        // whole file (O(N^2)); the new path appends with O_APPEND and
+        // updates the running counter only.
+        let bytes_received: i64 =
+            sqlx::query_scalar("SELECT bytes_received FROM oci_upload_sessions WHERE id = $1")
+                .bind(session_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            bytes_received,
+            (chunk_a.len() + chunk_b.len()) as i64,
+            "bytes_received must equal cumulative chunk size after two PATCHes"
+        );
+
+        let mut full = chunk_a.clone();
+        full.extend_from_slice(&chunk_b);
+        let digest = format!("sha256:{}", sha256_hex(&full));
+
+        // PUT complete with the digest of the concatenated chunks.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/{}/myimage/blobs/uploads/{}?digest={}",
+                repo_key, session_id, digest
+            ))
+            .header("Authorization", &auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = make_app().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "multi-chunk PUT complete with matching digest should return 201"
+        );
+
+        // Exactly one oci_blobs row.
+        let blob_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM oci_blobs WHERE repository_id = $1 AND digest = $2",
+        )
+        .bind(repo_id)
+        .bind(&digest)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(blob_rows, 1, "exactly one oci_blobs row should be recorded");
+
+        cleanup_all(&pool, &[repo_id], user_id, &[storage_dir]).await;
     }
 }
