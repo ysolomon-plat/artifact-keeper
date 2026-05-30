@@ -2619,4 +2619,389 @@ mod tests {
         assert!(msg.contains("not-a-cve"));
         assert!(msg.contains("CVE-YYYY-N"));
     }
+
+    // -----------------------------------------------------------------------
+    // #1426: DB-backed handler coverage for update_cve_status_by_artifact_cve
+    //
+    // These exercise the full handler call chain (CVE-id validation,
+    // ensure_artifact_repo_access, CveStatus::parse, service invocation,
+    // JSON serialization) against a real Postgres pool. They no-op when
+    // `DATABASE_URL` is unset so `cargo test --lib` still works locally,
+    // and run in CI's coverage job where Postgres is seeded.
+    // -----------------------------------------------------------------------
+
+    /// Seed one scan_findings row tied to (artifact, cve_id) using the same
+    /// shape the scanner ingest path writes. Mirrors the helpers in
+    /// `services::sbom_service::tests` but lives here so handler tests
+    /// don't depend on internal service plumbing.
+    async fn seed_finding_for_handler(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+        repo_id: Uuid,
+        cve_id: &str,
+        severity: &str,
+    ) {
+        let scan_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO scan_results (id, artifact_id, repository_id, scan_type,
+                                      status, findings_count, started_at, completed_at)
+            VALUES ($1, $2, $3, 'dependency', 'completed', 1, NOW(), NOW())
+            "#,
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_result");
+
+        sqlx::query(
+            r#"
+            INSERT INTO scan_findings (scan_result_id, artifact_id, severity, title,
+                                       cve_id, source, is_acknowledged)
+            VALUES ($1, $2, $3, $4, $5, 'trivy', false)
+            "#,
+        )
+        .bind(scan_id)
+        .bind(artifact_id)
+        .bind(severity)
+        .bind(format!("test {}", cve_id))
+        .bind(cve_id)
+        .execute(pool)
+        .await
+        .expect("seed scan_finding");
+    }
+
+    /// Seed an artifact row attached to the fixture's repo so
+    /// `ensure_artifact_repo_access` finds it.
+    async fn seed_artifact_for_handler(pool: &sqlx::PgPool, repo_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        let path = format!("{}/{}", repo_id, id);
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (id, repository_id, name, path, version,
+                                   size_bytes, checksum_sha256, content_type,
+                                   storage_key, is_deleted)
+            VALUES ($1, $2, $3, $4, '1.0.0', 1024, $5,
+                    'application/octet-stream', $4, false)
+            "#,
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(format!("handler-art-{}", id))
+        .bind(&path)
+        .bind(format!("sha256-handler-{}", id))
+        .execute(pool)
+        .await
+        .expect("seed artifact for handler test");
+        id
+    }
+
+    /// Drop scan_findings/scan_results owned by this repo. Used in addition
+    /// to `tdh::cleanup` because that helper only knows about artifacts +
+    /// repositories.
+    async fn teardown_scans(pool: &sqlx::PgPool, repo_id: Uuid) {
+        let _ = sqlx::query(
+            "DELETE FROM scan_findings WHERE scan_result_id IN \
+             (SELECT id FROM scan_results WHERE repository_id = $1)",
+        )
+        .bind(repo_id)
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("DELETE FROM scan_results WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_handler_rejects_malformed_cve_id_before_db_lookup() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "not-a-cve".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("not-a-cve"));
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_rejects_unknown_status_string() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        // `CveStatus::parse` returns None for any string outside the four
+        // known variants. Handler must surface that as 400 with the
+        // original status text echoed so the client can debug.
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-8888".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "definitely-not-a-status".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.contains("definitely-not-a-status"));
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_acknowledge_happy_path_returns_synth_entry() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-1010", "high").await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-1010".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: Some("handler test reason".to_string()),
+            }),
+        )
+        .await;
+
+        let entry = match &result {
+            Ok(axum::Json(e)) => e.clone(),
+            Err(err) => {
+                teardown_scans(&fx.pool, fx.repo_id).await;
+                fx.teardown().await;
+                panic!("expected Ok, got {:?}", err);
+            }
+        };
+
+        assert_eq!(entry.artifact_id, artifact_id);
+        assert_eq!(entry.cve_id.to_ascii_uppercase(), "CVE-2024-1010");
+        assert_eq!(entry.status, "acknowledged");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_handler_fixed_status_returns_validation_error() {
+        // `Fixed` is the curated-only lifecycle state; the handler must
+        // surface a 400 (Validation) rather than 500 or silent coercion.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-2020", "low").await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-2020".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "fixed".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::Validation(msg)) => {
+                assert!(msg.to_lowercase().contains("fixed"));
+            }
+            other => panic!("expected Validation, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_no_matching_scan_findings_returns_not_found() {
+        // Artifact exists and access check passes, but no scan_findings
+        // row matches (artifact, cve) -- handler must turn the service's
+        // NotFound into a 404, never a 500.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-3030".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        match result {
+            Err(AppError::NotFound(msg)) => {
+                assert!(msg.contains("CVE-2024-3030"));
+            }
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handler_normalizes_lowercase_cve_id_input() {
+        // The Security tab can surface mixed-case CVE ids depending on the
+        // scanner source; the handler must upper-case the input before
+        // calling the service so the canonical comparison still matches.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-4040", "medium")
+            .await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        // Send the CVE id lower-cased: handler must still match.
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "cve-2024-4040".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        let ok = result.is_ok();
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+        assert!(ok, "lower-case CVE id input must still match the row");
+    }
+
+    #[tokio::test]
+    async fn test_handler_accepts_ghsa_id() {
+        // GHSA-xxxx-xxxx-xxxx ids must reach the service path without
+        // being rejected by `is_valid_vuln_id`.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(
+            &fx.pool,
+            artifact_id,
+            fx.repo_id,
+            "GHSA-jf85-cpcp-j695",
+            "high",
+        )
+        .await;
+
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "GHSA-jf85-cpcp-j695".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "false_positive".to_string(),
+                reason: Some("not exploitable".to_string()),
+            }),
+        )
+        .await;
+
+        let entry = match &result {
+            Ok(axum::Json(e)) => e.clone(),
+            Err(err) => {
+                teardown_scans(&fx.pool, fx.repo_id).await;
+                fx.teardown().await;
+                panic!("expected Ok for GHSA id, got {:?}", err);
+            }
+        };
+        // false_positive collapses to "acknowledged" on the synth aggregate
+        // (scan_findings has no separate FP column).
+        assert_eq!(entry.status, "acknowledged");
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_handler_rejects_caller_without_repo_access() {
+        // `ensure_artifact_repo_access` must enforce the auth extension's
+        // `allowed_repo_ids` whitelist: a caller scoped to some other repo
+        // must see the same 404 they'd see if the artifact didn't exist,
+        // never the contents of a repo they can't access.
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let artifact_id = seed_artifact_for_handler(&fx.pool, fx.repo_id).await;
+        seed_finding_for_handler(&fx.pool, artifact_id, fx.repo_id, "CVE-2024-5050", "high").await;
+
+        // Build an auth extension whose allowed_repo_ids does NOT include
+        // the fixture's repo. Mirror tdh::make_auth then tighten scopes.
+        let mut auth = tdh::make_auth(fx.user_id, &fx.username);
+        auth.allowed_repo_ids = Some(vec![Uuid::new_v4()]);
+
+        let result = super::update_cve_status_by_artifact_cve(
+            axum::extract::State(fx.state.clone()),
+            axum::Extension(auth),
+            axum::extract::Path((artifact_id, "CVE-2024-5050".to_string())),
+            axum::Json(UpdateCveStatusRequest {
+                status: "acknowledged".to_string(),
+                reason: None,
+            }),
+        )
+        .await;
+
+        teardown_scans(&fx.pool, fx.repo_id).await;
+        fx.teardown().await;
+
+        // Repo-scope mismatch is surfaced as the same NotFound used for a
+        // missing artifact (deliberate: don't leak existence of inaccessible
+        // repos through error shape).
+        match result {
+            Err(AppError::NotFound(_)) => {}
+            other => panic!("expected NotFound for scoped-out caller, got {:?}", other),
+        }
+    }
 }
