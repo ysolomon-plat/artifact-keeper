@@ -39,12 +39,11 @@ use crate::storage::StorageLocation;
 /// are handled separately by parsing the Maven coordinate below.
 ///
 /// Primary file extensions (`.jar`, `.aar`, `.war`, `.ear`, `.zip`) are
-/// **deliberately excluded** from this list. Primary files always have
-/// their own row in `artifacts` (and therefore go through the
-/// SQL-backed `proxy_helpers::local_fetch_by_path`); allowing the
-/// storage fallback to serve a primary would silently bypass the
-/// quarantine and soft-delete gating on the primary's own row. The
-/// allowlist scopes the fallback to its documented purpose.
+/// **deliberately excluded** from this list. They are handled by the
+/// separate [`is_maven_primary_path`] check: a primary is only eligible
+/// for the storage fallback when a live sibling row anchors the GAV (see
+/// [`maven_local_fetch_storage_fallback`] Gate 1). Mixing them into this
+/// allowlist would let a primary through *without* that anchor check.
 const MAVEN_SECONDARY_FILE_EXTENSIONS: &[&str] = &[
     ".pom",
     ".module",
@@ -58,6 +57,29 @@ const MAVEN_SECONDARY_FILE_EXTENSIONS: &[&str] = &[
     ".md5",
     ".asc",
 ];
+
+/// Primary Maven artifact extensions. Under GAV grouping, only one file
+/// per `group/artifact/version/` directory gets its own `artifacts` row;
+/// when that canonical row is the `.pom`, the primary (`.jar`/`.aar`/…)
+/// has no row of its own and the SQL-only virtual download path misses
+/// it. These extensions are eligible for the storage fallback *only*
+/// when a live sibling row anchors the GAV (Gate 1 below); the row's
+/// quarantine / soft-delete state then gates the read.
+const MAVEN_PRIMARY_FILE_EXTENSIONS: &[&str] = &[".jar", ".aar", ".war", ".ear", ".zip"];
+
+#[inline]
+fn is_maven_primary_path(path: &str) -> bool {
+    // A primary has no classifier: `a-1.0.jar`, not `a-1.0-sources.jar`.
+    // Reuse the secondary classifier check so a classifier-bearing
+    // `.jar`/`.zip` (e.g. `-sources.jar`, `-linux-x86_64.zip`) stays on
+    // the secondary path and is never treated as a bare primary.
+    if is_maven_secondary_path(path) {
+        return false;
+    }
+    MAVEN_PRIMARY_FILE_EXTENSIONS
+        .iter()
+        .any(|ext| path.ends_with(ext))
+}
 
 #[inline]
 fn is_maven_secondary_path(path: &str) -> bool {
@@ -105,11 +127,13 @@ fn maven_gav_directory(artifact_path: &str) -> Option<&str> {
 /// files (which have no row of their own), this helper:
 ///
 /// 1. Refuses any path that is neither a known companion-file suffix
-///    ([`MAVEN_SECONDARY_FILE_EXTENSIONS`]) nor a valid Maven coordinate
-///    with a classifier.
-///    Primary `.jar`/`.aar`/`.war`/`.ear` paths fall back to
-///    `NotFound` here so the caller can't accidentally route them
-///    around their own SQL row.
+///    ([`MAVEN_SECONDARY_FILE_EXTENSIONS`]) / classifier artifact nor a
+///    primary extension ([`MAVEN_PRIMARY_FILE_EXTENSIONS`]). A primary
+///    (`.jar`/`.aar`/…) is admitted because GAV grouping can leave it
+///    rowless when the canonical row sits on a sibling (typically the
+///    `.pom`); its read is still gated by the live-sibling anchor and
+///    the quarantine / soft-delete check below, matching how the
+///    local-repo storage fallback already serves such a primary.
 /// 2. Looks up a "primary" sibling row in the same GAV directory and
 ///    verifies it is not soft-deleted and not quarantined before
 ///    serving the secondary bytes. A quarantined or deleted primary
@@ -133,10 +157,17 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<(Bytes, Option<String>), Response> {
-    // Gate 1: Only companion files and classifier artifacts are eligible.
-    // A primary `.jar`/`.aar`/etc. always has its own row and must travel
-    // the SQL path so its quarantine/soft-delete state is honored.
-    if !is_maven_secondary_path(artifact_path) {
+    // Gate 1: Restrict the fallback to recognizable Maven artifact files.
+    // Secondaries / classifier artifacts (`.pom`, `.module`, `-sources.jar`,
+    // `.sha512`, …) never carry their own row, so they always rely on this
+    // path. A primary (`.jar`/`.aar`/…) normally serves from its own row via
+    // `local_fetch_by_path`; it only reaches here when GAV grouping parked the
+    // canonical row on a sibling (typically the `.pom`), leaving the primary
+    // rowless. In both cases the live-sibling anchor (Gate 2) plus the
+    // quarantine / soft-delete check on that anchor (Gate 3) gate the read, so
+    // a primary can't bypass policy or be served without a real owning GAV.
+    // Anything else (e.g. a stray `.txt`) is refused outright.
+    if !is_maven_secondary_path(artifact_path) && !is_maven_primary_path(artifact_path) {
         return Err((StatusCode::NOT_FOUND, "Artifact not found").into_response());
     }
 
@@ -259,6 +290,44 @@ mod tests {
         }
         assert!(!is_maven_secondary_path(""));
         assert!(!is_maven_secondary_path("/"));
+    }
+
+    #[test]
+    fn test_is_maven_primary_path_recognizes_bare_primaries() {
+        for ext in [".jar", ".aar", ".war", ".ear", ".zip"] {
+            let path = format!("g/a/1.0/a-1.0{}", ext);
+            assert!(
+                is_maven_primary_path(&path),
+                "{} should be recognized as a primary",
+                ext
+            );
+            // A bare primary is never also a secondary.
+            assert!(!is_maven_secondary_path(&path));
+        }
+    }
+
+    #[test]
+    fn test_is_maven_primary_path_excludes_classifier_and_companions() {
+        // Classifier-bearing jars/zips and companion suffixes belong on
+        // the secondary path, NOT the primary path — otherwise a
+        // `-sources.jar` would be mis-routed.
+        for path in [
+            "g/a/1.0/a-1.0-sources.jar",
+            "g/a/1.0/a-1.0-javadoc.jar",
+            "g/a/1.0/a-1.0-plain.jar",
+            "g/a/1.0/a-1.0-linux-x86_64.zip",
+            "g/a/1.0/a-1.0.pom",
+            "g/a/1.0/a-1.0.jar.sha1",
+        ] {
+            assert!(
+                !is_maven_primary_path(path),
+                "{} must not be classified as a bare primary",
+                path
+            );
+        }
+        // Non-artifact paths are not primaries either.
+        assert!(!is_maven_primary_path(""));
+        assert!(!is_maven_primary_path("g/a/1.0/notes.txt"));
     }
 
     // ── parser edge cases (#1399 follow-up) ─────────────────────────
@@ -516,10 +585,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_storage_fallback_refuses_primary_extensions() {
-        // SECURITY: even if bytes exist at `maven/<path>.jar`, the
-        // storage fallback must refuse — primaries always have their
-        // own row and must travel the SQL path.
+    async fn test_storage_fallback_refuses_primary_without_sibling_row() {
+        // SECURITY: a primary with bytes on storage but NO anchoring
+        // sibling row in its GAV directory is an orphan and must be
+        // refused. The primary becomes eligible only once a live GAV
+        // sibling proves the local member owns the coordinate.
         let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
             return;
         };
@@ -537,9 +607,64 @@ mod tests {
             .expect("put");
             let err = maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, &path)
                 .await
-                .expect_err(&format!("primary {} must be refused", primary_ext));
+                .expect_err(&format!("orphan primary {} must be refused", primary_ext));
             assert_eq!(err.status(), StatusCode::NOT_FOUND);
         }
+
+        db_helpers::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_storage_fallback_serves_primary_jar_anchored_by_pom_row() {
+        // The "primary JAR 404" fix: GAV grouping parked the canonical
+        // row on the `.pom`, so the main `.jar` has no row of its own.
+        // Through a virtual repo `local_fetch_by_path` misses the jar
+        // path; the storage fallback must serve the jar bytes because a
+        // live sibling row (the pom) anchors the GAV — matching what the
+        // local-repo storage fallback already does.
+        let Some((pool, state, repo_id, repo, user_id)) = maven_fixture().await else {
+            return;
+        };
+        // Canonical row sits on the `.pom`, NOT the jar.
+        let _pom_row = insert_artifact(
+            &pool,
+            NewArtifact {
+                repository_id: repo_id,
+                path: "com/example/foo/1.0/foo-1.0.pom",
+                name: "foo",
+                version: "1.0",
+                size_bytes: 200,
+                checksum_sha256: "pom-sha",
+                content_type: "application/xml",
+                storage_key: "maven/com/example/foo/1.0/foo-1.0.pom",
+                uploaded_by: user_id,
+            },
+        )
+        .await
+        .expect("insert pom row");
+        // Jar bytes live only on storage (no row).
+        let jar_bytes = Bytes::from_static(b"PK\x03\x04 jar-bytes");
+        put_artifact_bytes(
+            &state,
+            &repo,
+            "maven/com/example/foo/1.0/foo-1.0.jar",
+            jar_bytes.clone(),
+        )
+        .await
+        .expect("put jar");
+
+        let location = repo.storage_location();
+        let (content, ct) = maven_local_fetch_storage_fallback(
+            &pool,
+            &state,
+            repo_id,
+            &location,
+            "com/example/foo/1.0/foo-1.0.jar",
+        )
+        .await
+        .expect("rowless primary jar must serve when anchored by a live sibling");
+        assert_eq!(&content[..], &jar_bytes[..]);
+        assert!(ct.is_none(), "helper returns None for content-type");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
