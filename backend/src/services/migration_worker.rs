@@ -1041,20 +1041,14 @@ impl MigrationWorker {
                 // Falls back to the legacy `<repo>/<source-path>` shape only
                 // when the format-aware parser couldn't recover a version
                 // (unknown format / unparseable filename).
-                let path_str = match package_type {
-                    // Maven/sbt/ivy paths include a group prefix
-                    // (e.g. com/example/artifact/version/file.jar) that
-                    // clients use verbatim when resolving. Reconstructing
-                    // as name/version/filename strips the group and
-                    // breaks resolution via /maven/ and /sbt/ endpoints.
-                    "maven" | "gradle" | "sbt" | "ivy" => artifact_path.to_string(),
-                    _ => match parsed.version.as_deref() {
-                        Some(ver) if !ver.is_empty() => {
-                            format!("{}/{}/{}", parsed.name, ver, filename)
-                        }
-                        _ => format!("{}/{}", repo_key, artifact_path),
-                    },
-                };
+                let path_str = migration_artifact_path(
+                    package_type,
+                    &parsed.name,
+                    parsed.version.as_deref(),
+                    filename,
+                    repo_key,
+                    artifact_path,
+                );
                 // Path-traversal guard: `path_str` is stored verbatim and
                 // used as the load-bearing lookup path, so reject anything
                 // with a leading `/` or a `..` segment rather than writing it.
@@ -1772,6 +1766,26 @@ pub(crate) fn build_source_path(repo_key: &str, artifact_path: &str) -> String {
     format!("{}/{}", repo_key, artifact_path)
 }
 
+fn migration_artifact_path(
+    package_type: &str,
+    parsed_name: &str,
+    version: Option<&str>,
+    filename: &str,
+    repo_key: &str,
+    artifact_path: &str,
+) -> String {
+    match package_type {
+        // Maven/sbt/ivy paths include a group prefix
+        // (e.g. com/example/artifact/version/file.jar) that clients use
+        // verbatim when resolving.
+        "maven" | "gradle" | "sbt" | "ivy" => artifact_path.to_string(),
+        _ => match version {
+            Some(ver) if !ver.is_empty() => format!("{}/{}/{}", parsed_name, ver, filename),
+            _ => format!("{}/{}", repo_key, artifact_path),
+        },
+    }
+}
+
 /// Reject artifact paths that could escape the repository root once stored
 /// verbatim. The migration now persists the raw external path as the
 /// load-bearing `path`, so a crafted export with a leading `/` or a `..`
@@ -2072,6 +2086,59 @@ mod tests {
             "cargo-cache",
             "requests/requests-2.28.0-py3-none-any.whl"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // migration_artifact_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_migration_artifact_path_preserves_maven_family_paths() {
+        let artifact_path = "com/depop/example/1.0.0/example-1.0.0.jar";
+
+        for package_type in ["maven", "gradle", "sbt", "ivy"] {
+            assert_eq!(
+                migration_artifact_path(
+                    package_type,
+                    "example",
+                    Some("1.0.0"),
+                    "example-1.0.0.jar",
+                    "depop-maven",
+                    artifact_path
+                ),
+                artifact_path
+            );
+        }
+    }
+
+    #[test]
+    fn test_migration_artifact_path_builds_canonical_non_maven_versioned_path() {
+        assert_eq!(
+            migration_artifact_path(
+                "npm",
+                "lodash",
+                Some("4.17.21"),
+                "lodash-4.17.21.tgz",
+                "depop-npm",
+                "lodash/-/lodash-4.17.21.tgz"
+            ),
+            "lodash/4.17.21/lodash-4.17.21.tgz"
+        );
+    }
+
+    #[test]
+    fn test_migration_artifact_path_falls_back_without_version() {
+        assert_eq!(
+            migration_artifact_path(
+                "generic",
+                "artifact.bin",
+                None,
+                "artifact.bin",
+                "depop-generic",
+                "nested/path/artifact.bin"
+            ),
+            "depop-generic/nested/path/artifact.bin"
+        );
     }
 
     // -----------------------------------------------------------------------
