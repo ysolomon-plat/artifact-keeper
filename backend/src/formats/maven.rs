@@ -55,20 +55,43 @@ impl MavenHandler {
     ) -> Result<(Option<String>, String)> {
         let expected_prefix = format!("{}-{}", artifact_id, version);
 
+        // SBT plugins publish with a short base name in the filename even though the
+        // directory uses the cross-versioned artifact ID (e.g. directory is
+        // `sbt-depop-publish_2.12_1.0` but filename is `sbt-depop-publish-2.0.4.jar`).
+        // Derive the short base name by stripping the `_scalaVer_sbtVer` suffix if present.
+        let short_base = artifact_id
+            .rfind('_')
+            .and_then(|i| artifact_id[..i].rfind('_'))
+            .map(|i| &artifact_id[..i]);
+
+        let short_prefix = short_base.map(|base| format!("{}-{}", base, version));
+
         // For SNAPSHOT versions, Maven resolves the filename to a timestamp like:
         // artifact-1.0.0-20260211.124623-1.jar instead of artifact-1.0.0-SNAPSHOT.jar
         // Accept either the exact version or the timestamp-resolved form.
         let snapshot_prefix = version
             .strip_suffix("-SNAPSHOT")
             .map(|base_version| format!("{}-{}", artifact_id, base_version));
+        let short_snapshot_prefix = version
+            .strip_suffix("-SNAPSHOT")
+            .and_then(|base_version| short_base.map(|base| format!("{}-{}", base, base_version)));
 
         let mut is_snapshot_timestamp = false;
         let remainder = if filename.starts_with(&expected_prefix) {
             &filename[expected_prefix.len()..]
+        } else if !version.ends_with("-SNAPSHOT")
+            && short_prefix.as_deref().map_or(false, |sp| filename.starts_with(sp))
+        {
+            // SBT plugin short filename (non-SNAPSHOT): strip the short prefix
+            &filename[short_prefix.as_ref().unwrap().len()..]
         } else if let Some(ref snap) = snapshot_prefix {
             if filename.starts_with(snap) {
                 is_snapshot_timestamp = true;
                 &filename[snap.len()..]
+            } else if short_snapshot_prefix.as_deref().map_or(false, |ssp| filename.starts_with(ssp)) {
+                // SBT plugin short filename (SNAPSHOT timestamp form)
+                is_snapshot_timestamp = true;
+                &filename[short_snapshot_prefix.as_ref().unwrap().len()..]
             } else {
                 // Could be metadata file
                 if filename == "maven-metadata.xml"
