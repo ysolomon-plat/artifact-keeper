@@ -174,17 +174,18 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     // committed between two separate queries can't be observed inconsistently
     // (which would let the quarantine check be skipped).
     if is_primary {
-        let own = sqlx::query_as::<_, (bool, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
-            "SELECT is_deleted, quarantine_status, quarantine_until \
+        let own =
+            sqlx::query_as::<_, (bool, Option<String>, Option<chrono::DateTime<chrono::Utc>>)>(
+                "SELECT is_deleted, quarantine_status, quarantine_until \
              FROM artifacts \
              WHERE repository_id = $1 AND path = $2 \
              LIMIT 1",
-        )
-        .bind(repo_id)
-        .bind(artifact_path)
-        .fetch_optional(db)
-        .await
-        .map_err(|e| internal_error("Database", e))?;
+            )
+            .bind(repo_id)
+            .bind(artifact_path)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| internal_error("Database", e))?;
 
         match own {
             // Retracted: refuse even if a live sibling would satisfy Gate 2.
