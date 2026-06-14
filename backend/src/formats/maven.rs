@@ -47,7 +47,6 @@ impl MavenHandler {
         })
     }
 
-    /// Parse filename to extract classifier and extension
     fn parse_filename(
         filename: &str,
         artifact_id: &str,
@@ -55,49 +54,81 @@ impl MavenHandler {
     ) -> Result<(Option<String>, String)> {
         let expected_prefix = format!("{}-{}", artifact_id, version);
 
-        // For SNAPSHOT versions, Maven resolves the filename to a timestamp like:
-        // artifact-1.0.0-20260211.124623-1.jar instead of artifact-1.0.0-SNAPSHOT.jar
-        // Accept either the exact version or the timestamp-resolved form.
-        let snapshot_prefix = version
-            .strip_suffix("-SNAPSHOT")
-            .map(|base_version| format!("{}-{}", artifact_id, base_version));
-
-        let mut is_snapshot_timestamp = false;
-        let remainder = if filename.starts_with(&expected_prefix) {
-            &filename[expected_prefix.len()..]
-        } else if let Some(ref snap) = snapshot_prefix {
-            if filename.starts_with(snap) {
-                is_snapshot_timestamp = true;
-                &filename[snap.len()..]
+        // sbt cross-versioned plugins use artifact IDs like `sbt-foo_2.12_1.0` (from the
+        // directory) but publish filenames in short form: `sbt-foo-2.0.4.jar`. Strip up to
+        // two trailing `_segment` components where each looks like a version (has `.` or
+        // starts with a digit), giving the short base name.
+        let looks_like_version =
+            |s: &str| s.contains('.') || s.chars().next().map_or(false, |c| c.is_ascii_digit());
+        let short_base: Option<&str> = artifact_id.rfind('_').and_then(|i| {
+            if looks_like_version(&artifact_id[i + 1..]) {
+                let after = &artifact_id[..i];
+                Some(
+                    after
+                        .rfind('_')
+                        .filter(|&j| looks_like_version(&after[j + 1..]))
+                        .map_or(after, |j| &after[..j]),
+                )
             } else {
-                // Could be metadata file
-                if filename == "maven-metadata.xml"
-                    || filename.ends_with(".md5")
-                    || filename.ends_with(".sha1")
-                    || filename.ends_with(".sha256")
-                    || filename.ends_with(".sha512")
-                {
-                    return Ok((None, filename.to_string()));
-                }
-                return Err(AppError::Validation(format!(
-                    "Invalid Maven filename: expected to start with {}",
-                    expected_prefix
-                )));
+                None
             }
-        } else {
-            // Could be metadata file
-            if filename == "maven-metadata.xml"
-                || filename.ends_with(".md5")
-                || filename.ends_with(".sha1")
-                || filename.ends_with(".sha256")
-                || filename.ends_with(".sha512")
-            {
-                return Ok((None, filename.to_string()));
-            }
-            return Err(AppError::Validation(format!(
+        });
+
+        let base_version = version.strip_suffix("-SNAPSHOT");
+        let snapshot_prefix = base_version.map(|bv| format!("{}-{}", artifact_id, bv));
+        let short_prefix = short_base.map(|sb| format!("{}-{}", sb, version));
+        let short_snapshot_prefix = short_base
+            .zip(base_version)
+            .map(|(sb, bv)| format!("{}-{}", sb, bv));
+
+        let is_metadata = |f: &str| {
+            f == "maven-metadata.xml"
+                || f.ends_with(".md5")
+                || f.ends_with(".sha1")
+                || f.ends_with(".sha256")
+                || f.ends_with(".sha512")
+        };
+        let validation_err = || {
+            Err(AppError::Validation(format!(
                 "Invalid Maven filename: expected to start with {}",
                 expected_prefix
-            )));
+            )))
+        };
+
+        let mut is_snapshot_timestamp = false;
+        // Try prefixes in priority order using a labeled block.
+        // `short_prefix` uses the full version (including -SNAPSHOT) so it matches the exact-SNAPSHOT
+        // short form (`sbt-foo-2.0.4-SNAPSHOT.jar`) before `short_snapshot_prefix` can misparse
+        // `-SNAPSHOT` as a classifier.
+        let remainder: &str = 'find: {
+            if filename.starts_with(&expected_prefix) {
+                break 'find &filename[expected_prefix.len()..];
+            }
+            if let Some(ref snap) = snapshot_prefix {
+                if filename.starts_with(snap.as_str()) {
+                    let rem = &filename[snap.len()..];
+                    let stripped = Self::strip_snapshot_timestamp(rem);
+                    is_snapshot_timestamp = stripped != rem;
+                    break 'find stripped;
+                }
+            }
+            if let Some(ref spfx) = short_prefix {
+                if filename.starts_with(spfx.as_str()) {
+                    break 'find &filename[spfx.len()..];
+                }
+            }
+            if let Some(ref ssnap) = short_snapshot_prefix {
+                if filename.starts_with(ssnap.as_str()) {
+                    let rem = &filename[ssnap.len()..];
+                    let stripped = Self::strip_snapshot_timestamp(rem);
+                    is_snapshot_timestamp = stripped != rem;
+                    break 'find stripped;
+                }
+            }
+            if is_metadata(filename) {
+                return Ok((None, filename.to_string()));
+            }
+            return validation_err();
         };
 
         if remainder.is_empty() {
@@ -106,22 +137,11 @@ impl MavenHandler {
             ));
         }
 
-        // For snapshot timestamps, the remainder starts with the
-        // timestamp-build suffix: -YYYYMMDD.HHMMSS-N
-        // Strip it so classifier parsing works correctly.
-        let remainder = if is_snapshot_timestamp {
-            Self::strip_snapshot_timestamp(remainder)
-        } else {
-            remainder
-        };
+        // `is_snapshot_timestamp` is only set when strip_snapshot_timestamp actually removed
+        // a timestamp suffix. If not set, `-SNAPSHOT` in the remainder is a classifier (#1399).
+        let _ = is_snapshot_timestamp; // consumed above; kept for clarity
 
-        // Check for classifier: -classifier.ext
-        //
-        // Edge case: `artifact-version-.ext` has an empty classifier and is
-        // not a valid Maven coordinate. Reject it via the trailing
-        // `Err` branch below so callers (e.g. `is_maven_secondary_path` in
-        // the virtual-repo fallback) don't treat it as a classifier
-        // artifact and route it around its own SQL row. See #1399.
+        // Classifier: -classifier.ext (empty classifier is not valid — see #1399).
         if let Some(rest) = remainder.strip_prefix('-') {
             if let Some(dot_pos) = rest.rfind('.') {
                 let classifier = &rest[..dot_pos];
@@ -142,18 +162,9 @@ impl MavenHandler {
         ))
     }
 
-    /// Strip a Maven SNAPSHOT timestamp-build suffix from a remainder string.
-    ///
-    /// Pattern: `-YYYYMMDD.HHMMSS-N` where N is one or more digits.
-    ///
-    /// Examples:
-    /// - `"-20260314.155654-1.jar"` -> `".jar"`
-    /// - `"-20260314.155654-1-sources.jar"` -> `"-sources.jar"`
-    ///
-    /// Returns the input unchanged if the pattern doesn't match.
+    /// Strip `-YYYYMMDD.HHMMSS-N` from the start of `remainder`. Returns input unchanged on mismatch.
     fn strip_snapshot_timestamp(remainder: &str) -> &str {
         let b = remainder.as_bytes();
-        // Minimum: -YYYYMMDD.HHMMSS-N = 18 chars
         if b.len() < 18
             || b[0] != b'-'
             || !b[1..9].iter().all(u8::is_ascii_digit)
@@ -163,7 +174,6 @@ impl MavenHandler {
         {
             return remainder;
         }
-        // Skip past the build number digits after the second dash
         let end = b[17..]
             .iter()
             .position(|c| !c.is_ascii_digit())
@@ -630,5 +640,55 @@ mod tests {
         assert_eq!(g, "com.example");
         assert_eq!(a, "my-lib");
         assert_eq!(versions, vec!["1.0.0", "1.1.0"]);
+    }
+
+    #[test]
+    fn test_parse_sbt_plugin_short_filename() {
+        // sbt plugins publish under `artifact_2.12_1.0/` but use a short filename.
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/sbt-foo_2.12_1.0/2.0.4/sbt-foo-2.0.4.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.artifact_id, "sbt-foo_2.12_1.0");
+        assert_eq!(coords.version, "2.0.4");
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_sbt_plugin_single_underscore() {
+        // Plugins with only one underscore (e.g. scala-version only) must also work.
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/sbt-foo_2.12/2.0.4/sbt-foo-2.0.4.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.artifact_id, "sbt-foo_2.12");
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_sbt_plugin_snapshot_timestamp() {
+        // sbt plugin SNAPSHOT with a timestamp filename.
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/sbt-foo_2.12_1.0/2.0.4-SNAPSHOT/sbt-foo-2.0.4-20240101.120000-3.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.artifact_id, "sbt-foo_2.12_1.0");
+        assert_eq!(coords.version, "2.0.4-SNAPSHOT");
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
+    }
+
+    #[test]
+    fn test_parse_sbt_plugin_exact_snapshot_not_misclassified() {
+        // Exact-SNAPSHOT filename (`sbt-foo-2.0.4-SNAPSHOT.jar`) must NOT parse
+        // `-SNAPSHOT` as a classifier — it should be a no-classifier `.jar`.
+        let coords = MavenHandler::parse_coordinates(
+            "com/example/sbt-foo_2.12_1.0/2.0.4-SNAPSHOT/sbt-foo-2.0.4-SNAPSHOT.jar",
+        )
+        .unwrap();
+        assert_eq!(coords.classifier, None);
+        assert_eq!(coords.extension, "jar");
     }
 }
