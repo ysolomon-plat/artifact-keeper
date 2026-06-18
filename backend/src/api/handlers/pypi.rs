@@ -1101,6 +1101,14 @@ async fn serve_file(
                     let normalized = PypiHandler::normalize_name(project);
                     let local_cache_path = format!("simple/{}/{}", normalized, filename);
 
+                    // #1555: redirect to a presigned URL on a fresh cache hit
+                    // before falling back to streaming.
+                    if let Some(redirect) =
+                        pypi_proxy_cache_redirect(state, proxy, repo_key, &local_cache_path).await
+                    {
+                        return Ok(redirect);
+                    }
+
                     if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
                         proxy,
                         repo.id,
@@ -1211,6 +1219,19 @@ async fn serve_file(
                             // cached from a previous request through this member.
                             let normalized = PypiHandler::normalize_name(project);
                             let local_cache_path = format!("simple/{}/{}", normalized, filename);
+
+                            // #1555: redirect to a presigned URL on a fresh
+                            // cache hit before falling back to streaming.
+                            if let Some(redirect) = pypi_proxy_cache_redirect(
+                                state,
+                                proxy,
+                                &member.key,
+                                &local_cache_path,
+                            )
+                            .await
+                            {
+                                return Ok(redirect);
+                            }
 
                             if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
                                 proxy,
@@ -1506,6 +1527,40 @@ async fn fetch_from_pypi_remote(
     .await?;
 
     Ok(content)
+}
+
+/// #1555: presigned-redirect fast path for a fresh proxy-cache hit on a remote
+/// PyPI member. Returns `Some(307 redirect)` only when presigned downloads are
+/// enabled and the cache is fresh, signing the cache key through the proxy's own
+/// no-prefix backend (proxy-cache content lives at the storage root). Returns
+/// `None` on a miss/disabled so the caller falls back to the streaming path,
+/// which resolves the real upstream URL via the simple index — never via a
+/// presumed download URL.
+async fn pypi_proxy_cache_redirect(
+    state: &SharedState,
+    proxy: &crate::services::proxy_service::ProxyService,
+    repo_key: &str,
+    cache_path: &str,
+) -> Option<Response> {
+    if !state.config.presigned_downloads_enabled {
+        return None;
+    }
+    if !proxy.is_cache_fresh(repo_key, cache_path).await {
+        return None;
+    }
+    let cache_key =
+        crate::services::proxy_service::ProxyService::cache_storage_key(repo_key, cache_path)
+            .ok()?;
+    let storage = proxy.cache_storage_backend()?;
+    let expiry = std::time::Duration::from_secs(state.config.presigned_download_expiry_secs);
+    proxy_helpers::try_proxy_cache_redirect(
+        storage.as_ref(),
+        &cache_key,
+        /* presigned_enabled = */ true,
+        expiry,
+        /* cache_is_fresh = */ true,
+    )
+    .await
 }
 
 /// Streaming sibling of [`fetch_from_pypi_remote`] (#895 OOM relief).
@@ -5123,6 +5178,62 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(body_bytes, wheel_body);
+    }
+
+    #[test]
+    fn test_serve_file_presign_redirect_precedes_streaming_1555() {
+        // #1555: on a fresh proxy-cache hit, the PyPI remote download path must
+        // attempt a presigned redirect (via the proxy's no-prefix handle)
+        // BEFORE falling back to `proxy_check_cache_streaming` / streaming, so
+        // large wheels are not streamed through the backend. The streaming
+        // fallback (#1215 OOM relief) must still be present for cache misses.
+        let src = include_str!("pypi.rs");
+        let fn_start = src
+            .find("async fn serve_file(")
+            .expect("serve_file must exist");
+        let next = src[fn_start + 1..]
+            .find("\nasync fn ")
+            .map(|p| fn_start + 1 + p)
+            .unwrap_or(src.len());
+        let body = &src[fn_start..next];
+
+        let redirect_pos = body
+            .find("pypi_proxy_cache_redirect(")
+            .expect("serve_file MUST attempt pypi_proxy_cache_redirect (#1555)");
+        let stream_pos = body
+            .find("proxy_check_cache_streaming(")
+            .expect("serve_file MUST retain the streaming fallback (#1215)");
+        assert!(
+            redirect_pos < stream_pos,
+            "the presigned redirect attempt (#1555) MUST come BEFORE the \
+             streaming cache check (#1215).",
+        );
+        assert!(
+            body.contains("fetch_from_pypi_remote_streaming("),
+            "serve_file MUST resolve the real upstream URL via \
+             fetch_from_pypi_remote_streaming on a miss, never via a presumed \
+             download URL (#1555).",
+        );
+    }
+
+    #[test]
+    fn test_pypi_proxy_cache_redirect_uses_no_prefix_handle_1555() {
+        // The presign helper must sign through the proxy's no-prefix backend.
+        let src = include_str!("pypi.rs");
+        let fn_start = src
+            .find("async fn pypi_proxy_cache_redirect(")
+            .expect("pypi_proxy_cache_redirect must exist");
+        let window_end = (fn_start + 1500).min(src.len());
+        let window = &src[fn_start..window_end];
+        assert!(
+            window.contains("cache_storage_backend("),
+            "pypi_proxy_cache_redirect MUST sign via cache_storage_backend() \
+             (no-prefix handle), not a prefixed repo handle (#1555).",
+        );
+        assert!(
+            window.contains("is_cache_fresh("),
+            "pypi_proxy_cache_redirect MUST gate on is_cache_fresh (#1555).",
+        );
     }
 
     #[tokio::test]

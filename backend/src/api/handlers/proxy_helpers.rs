@@ -681,17 +681,16 @@ pub async fn proxy_fetch_or_redirect(
         .map_err(|e| map_proxy_error(repo_key, path, e))?;
     let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
     let presigned_enabled = state.config.presigned_downloads_enabled;
-    let storage_location = StorageLocation {
-        backend: state.config.storage_backend.clone(),
-        path: state.config.storage_path.clone(),
-    };
 
     // Fast path (#1018): if presigned downloads are enabled and the proxy
     // cache is already fresh, redirect to the signed URL without ever
     // pulling the cached body into the backend's memory. The freshness
     // probe is metadata-only (HEAD-equivalent on cloud backends).
     if presigned_enabled && proxy_service.is_cache_fresh(repo_key, path).await {
-        if let Ok(storage) = state.storage_for_repo(&storage_location) {
+        // #1555: proxy-cache content is stored without the global key prefix,
+        // so it must be signed through the proxy's own (no-prefix) backend, not
+        // the prefixed repo handle, or the signed key 404s in the object store.
+        if let Some(storage) = proxy_service.cache_storage_backend() {
             if let Some(redirect) = try_proxy_cache_redirect(
                 storage.as_ref(),
                 &cache_key,
@@ -715,7 +714,10 @@ pub async fn proxy_fetch_or_redirect(
     // If presigned is configured, prefer redirecting to the just-populated
     // cache entry over streaming the buffered content back to the client.
     if presigned_enabled {
-        if let Ok(storage) = state.storage_for_repo(&storage_location) {
+        // #1555: sign the just-populated cache entry through the proxy's
+        // no-prefix backend (same handle that wrote it), not the prefixed
+        // repo handle.
+        if let Some(storage) = proxy_service.cache_storage_backend() {
             if let Some(redirect) =
                 try_presigned_redirect(storage.as_ref(), &cache_key, true, expiry).await
             {
@@ -1284,26 +1286,25 @@ where
                     if state.config.presigned_downloads_enabled
                         && proxy.is_cache_fresh(&member.key, path).await
                     {
-                        if let Ok(cache_key) = ProxyService::cache_storage_key(&member.key, path) {
-                            let storage_location = StorageLocation {
-                                backend: state.config.storage_backend.clone(),
-                                path: state.config.storage_path.clone(),
-                            };
-                            if let Ok(storage) = state.storage_for_repo(&storage_location) {
-                                let expiry = Duration::from_secs(
-                                    state.config.presigned_download_expiry_secs,
-                                );
-                                if let Some(redirect) = try_proxy_cache_redirect(
-                                    storage.as_ref(),
-                                    &cache_key,
-                                    /* presigned_enabled = */ true,
-                                    expiry,
-                                    /* cache_is_fresh = */ true,
-                                )
-                                .await
-                                {
-                                    return Ok(redirect);
-                                }
+                        if let (Ok(cache_key), Some(storage)) = (
+                            ProxyService::cache_storage_key(&member.key, path),
+                            proxy.cache_storage_backend(),
+                        ) {
+                            // #1555: sign through the proxy's no-prefix backend
+                            // (proxy-cache content lives at the storage root,
+                            // not under the global key prefix).
+                            let expiry =
+                                Duration::from_secs(state.config.presigned_download_expiry_secs);
+                            if let Some(redirect) = try_proxy_cache_redirect(
+                                storage.as_ref(),
+                                &cache_key,
+                                /* presigned_enabled = */ true,
+                                expiry,
+                                /* cache_is_fresh = */ true,
+                            )
+                            .await
+                            {
+                                return Ok(redirect);
                             }
                         }
                     }
@@ -1946,8 +1947,25 @@ pub async fn local_fetch_or_redirect(
     // Try presigned redirect before reading content into memory
     if state.config.presigned_downloads_enabled {
         let expiry = Duration::from_secs(state.config.presigned_download_expiry_secs);
+        // #1555: proxy-cache content (remote members) lives at the storage root
+        // with no key prefix, so it must be signed through the proxy's own
+        // no-prefix backend. Hosted artifacts are content-addressed under the
+        // global prefix and sign correctly via the repo handle — only switch
+        // handles for proxy-cache keys.
+        let cache_backend = if ProxyService::is_proxy_cache_key(&artifact.storage_key) {
+            state
+                .proxy_service
+                .as_deref()
+                .and_then(|p| p.cache_storage_backend())
+        } else {
+            None
+        };
+        let presign_storage: &dyn crate::storage::StorageBackend = match &cache_backend {
+            Some(b) => b.as_ref(),
+            None => storage.as_ref(),
+        };
         if let Some(redirect) =
-            try_presigned_redirect(storage.as_ref(), &artifact.storage_key, true, expiry).await
+            try_presigned_redirect(presign_storage, &artifact.storage_key, true, expiry).await
         {
             return Ok(redirect);
         }
@@ -6011,6 +6029,50 @@ mod tests {
             "the presigned redirect attempt (#1555) MUST come BEFORE the \
              streaming fallback (#1215); otherwise cached large artifacts \
              still stream through the backend.",
+        );
+    }
+
+    #[test]
+    fn test_proxy_cache_presign_uses_no_prefix_handle_1555() {
+        // #1555: proxy-cache content lives at the storage ROOT (no global key
+        // prefix), so every proxy-cache presign MUST sign through the proxy's
+        // own no-prefix backend (`cache_storage_backend()`), never through the
+        // prefixed `state.storage_for_repo(...)` handle — otherwise the signed
+        // key carries the prefix and 404s in the object store.
+        let src = include_str!("proxy_helpers.rs");
+
+        for fn_name in [
+            "pub async fn proxy_fetch_or_redirect(",
+            "pub async fn resolve_virtual_download_streaming<",
+            "pub async fn local_fetch_or_redirect(",
+        ] {
+            let fn_start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("{fn_name} must exist"));
+            // Window large enough to cover the function body but bounded so a
+            // later function's tokens cannot satisfy the assertion.
+            let window_end = (fn_start + 4096).min(src.len());
+            let window = &src[fn_start..window_end];
+
+            assert!(
+                window.contains("cache_storage_backend("),
+                "`{fn_name}` MUST presign proxy-cache keys via \
+                 `cache_storage_backend()` (the no-prefix handle), not the \
+                 prefixed repo handle (#1555).",
+            );
+        }
+
+        // The prefixed-handle presign for proxy-cache keys was the bug: the
+        // proxy fast path must no longer reach for `storage_for_repo` to sign.
+        let fn_start = src
+            .find("pub async fn proxy_fetch_or_redirect(")
+            .expect("proxy_fetch_or_redirect must exist");
+        let window_end = (fn_start + 4096).min(src.len());
+        let window = &src[fn_start..window_end];
+        assert!(
+            !window.contains("storage_for_repo("),
+            "`proxy_fetch_or_redirect` MUST NOT sign proxy-cache keys through \
+             the prefixed `storage_for_repo(` handle (#1555).",
         );
     }
 
