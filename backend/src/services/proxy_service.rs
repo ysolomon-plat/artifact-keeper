@@ -2022,6 +2022,19 @@ impl ProxyService {
     /// If the HEAD itself errors (transport failure mid-revalidation), we
     /// treat the cache as not-fresh and fall through to the slow path
     /// rather than silently serving a possibly-stale URL.
+    /// Storage backend handle that owns the proxy cache objects.
+    ///
+    /// Proxy-cache content lives at the storage root (`proxy-cache/<repo>/...`)
+    /// with no configured key prefix. Presigning a cache key MUST go through
+    /// this handle — the same one `is_cache_fresh` and the cache reads/writes
+    /// use — so the signed key matches where the object actually lives. Signing
+    /// via a prefixed handle yields a key the object store has no object for.
+    pub fn cache_storage_backend(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::storage::StorageBackend>> {
+        self.storage.presign_backend()
+    }
+
     pub async fn is_cache_fresh(&self, repo_key: &str, path: &str) -> bool {
         // A path that fails validation cannot have produced a cache entry
         // we'd want to redirect to anyway: treat it as a miss so the caller
@@ -3139,6 +3152,16 @@ impl ProxyService {
     /// target from drifting out of sync (#1018).
     pub(crate) fn cache_storage_key(repo_key: &str, path: &str) -> Result<String> {
         CacheKeys::derive(repo_key, path).map(|k| k.content)
+    }
+
+    /// Whether `storage_key` addresses proxy-cache content.
+    ///
+    /// Proxy-cache keys are `proxy-cache/<repo_key>/<path>/__content__` and live
+    /// at the storage root (no global key prefix), unlike hosted artifacts. The
+    /// distinction matters when presigning: cache keys must be signed through
+    /// the no-prefix [`Self::cache_storage_backend`] handle (#1555).
+    pub fn is_proxy_cache_key(storage_key: &str) -> bool {
+        storage_key.starts_with("proxy-cache/")
     }
 
     /// Generate storage key for cache metadata

@@ -354,19 +354,19 @@ macro_rules! impl_storage_wrapper {
         #[async_trait]
         impl StorageBackend for $wrapper {
             async fn put(&self, key: &str, content: Bytes) -> Result<()> {
-                crate::storage::StorageBackend::put(&self.inner, key, content).await
+                crate::storage::StorageBackend::put(self.inner.as_ref(), key, content).await
             }
             async fn get(&self, key: &str) -> Result<Bytes> {
-                crate::storage::StorageBackend::get(&self.inner, key).await
+                crate::storage::StorageBackend::get(self.inner.as_ref(), key).await
             }
             async fn exists(&self, key: &str) -> Result<bool> {
-                crate::storage::StorageBackend::exists(&self.inner, key).await
+                crate::storage::StorageBackend::exists(self.inner.as_ref(), key).await
             }
             async fn head_etag(&self, key: &str) -> Result<Option<String>> {
-                crate::storage::StorageBackend::head_etag(&self.inner, key).await
+                crate::storage::StorageBackend::head_etag(self.inner.as_ref(), key).await
             }
             async fn delete(&self, key: &str) -> Result<()> {
-                crate::storage::StorageBackend::delete(&self.inner, key).await
+                crate::storage::StorageBackend::delete(self.inner.as_ref(), key).await
             }
             async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>> {
                 self.inner.list(prefix).await
@@ -381,7 +381,7 @@ macro_rules! impl_storage_wrapper {
             // streaming impls so we pick up S3 ranged GETs, GCS chunked
             // reads, etc., without buffering through this wrapper.
             async fn get_stream(&self, key: &str) -> Result<BoxStream<'static, Result<Bytes>>> {
-                crate::storage::StorageBackend::get_stream(&self.inner, key).await
+                crate::storage::StorageBackend::get_stream(self.inner.as_ref(), key).await
             }
             async fn put_stream(
                 &self,
@@ -389,7 +389,8 @@ macro_rules! impl_storage_wrapper {
                 stream: BoxStream<'static, Result<Bytes>>,
             ) -> Result<PutStreamResult> {
                 let inner_result =
-                    crate::storage::StorageBackend::put_stream(&self.inner, key, stream).await?;
+                    crate::storage::StorageBackend::put_stream(self.inner.as_ref(), key, stream)
+                        .await?;
                 // The two PutStreamResult types are structurally identical
                 // (sha256 hex + byte count); translate at the boundary.
                 Ok(PutStreamResult {
@@ -401,25 +402,13 @@ macro_rules! impl_storage_wrapper {
     };
 }
 
-/// S3 storage backend (wrapper for integration with StorageService)
+/// S3 storage backend (wrapper for integration with StorageService).
+///
+/// Holds the inner backend behind an `Arc` so the same no-prefix object can
+/// also be handed out as a presign-capable `crate::storage::StorageBackend`
+/// (see `StorageService::presign_backend`).
 pub struct S3BackendWrapper {
-    inner: crate::storage::s3::S3Backend,
-}
-
-impl S3BackendWrapper {
-    pub async fn from_config(config: &Config) -> crate::error::Result<Self> {
-        let s3_config = crate::storage::s3::S3Config::new(
-            config.s3_bucket.clone().unwrap_or_default(),
-            config
-                .s3_region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_string()),
-            config.s3_endpoint.clone(),
-            None, // No prefix by default
-        );
-        let inner = crate::storage::s3::S3Backend::new(s3_config).await?;
-        Ok(Self { inner })
-    }
+    inner: Arc<crate::storage::s3::S3Backend>,
 }
 
 impl_storage_wrapper!(S3BackendWrapper, crate::storage::s3::S3Backend);
@@ -430,15 +419,7 @@ impl_storage_wrapper!(S3BackendWrapper, crate::storage::s3::S3Backend);
 /// `crate::storage` trait and the extra `list`/`copy`/`size` methods to
 /// `GcsBackend`'s inherent methods.
 pub struct GcsBackendWrapper {
-    inner: crate::storage::gcs::GcsBackend,
-}
-
-impl GcsBackendWrapper {
-    pub async fn from_config(_config: &Config) -> crate::error::Result<Self> {
-        let gcs_config = crate::storage::gcs::GcsConfig::from_env()?;
-        let inner = crate::storage::gcs::GcsBackend::new(gcs_config).await?;
-        Ok(Self { inner })
-    }
+    inner: Arc<crate::storage::gcs::GcsBackend>,
 }
 
 impl_storage_wrapper!(GcsBackendWrapper, crate::storage::gcs::GcsBackend);
@@ -446,24 +427,51 @@ impl_storage_wrapper!(GcsBackendWrapper, crate::storage::gcs::GcsBackend);
 /// Storage service facade
 pub struct StorageService {
     backend: Arc<dyn StorageBackend>,
+    /// Presign-capable view of the same underlying object store, when the
+    /// backend supports it (S3/GCS). `None` for filesystem and test backends.
+    ///
+    /// This is the concrete `crate::storage::StorageBackend` (the trait that
+    /// carries `get_presigned_url`), not the facade trait above. Proxy-cache
+    /// presigns must use THIS handle so the signed key matches the no-prefix
+    /// layout the proxy cache writes (#1555).
+    presign_backend: Option<Arc<dyn crate::storage::StorageBackend>>,
 }
 
 impl StorageService {
     /// Create storage service from config
     pub async fn from_config(config: &Config) -> Result<Self> {
-        let backend: Arc<dyn StorageBackend> = match config.storage_backend.as_str() {
+        let (backend, presign_backend): (
+            Arc<dyn StorageBackend>,
+            Option<Arc<dyn crate::storage::StorageBackend>>,
+        ) = match config.storage_backend.as_str() {
             "filesystem" => {
                 let path = PathBuf::from(&config.storage_path);
                 fs::create_dir_all(&path).await?;
-                Arc::new(FilesystemBackend::new(path))
+                (Arc::new(FilesystemBackend::new(path)), None)
             }
             "s3" => {
-                let s3_backend = S3BackendWrapper::from_config(config).await?;
-                Arc::new(s3_backend)
+                let s3_config = crate::storage::s3::S3Config::new(
+                    config.s3_bucket.clone().unwrap_or_default(),
+                    config
+                        .s3_region
+                        .clone()
+                        .unwrap_or_else(|| "us-east-1".to_string()),
+                    config.s3_endpoint.clone(),
+                    None, // No prefix: proxy-cache content lives at the bucket root.
+                );
+                let inner = Arc::new(crate::storage::s3::S3Backend::new(s3_config).await?);
+                let wrapper = Arc::new(S3BackendWrapper {
+                    inner: Arc::clone(&inner),
+                });
+                (wrapper, Some(inner))
             }
             "gcs" => {
-                let wrapper = GcsBackendWrapper::from_config(config).await?;
-                Arc::new(wrapper)
+                let gcs_config = crate::storage::gcs::GcsConfig::from_env()?;
+                let inner = Arc::new(crate::storage::gcs::GcsBackend::new(gcs_config).await?);
+                let wrapper = Arc::new(GcsBackendWrapper {
+                    inner: Arc::clone(&inner),
+                });
+                (wrapper, Some(inner))
             }
             other => {
                 return Err(AppError::Config(format!(
@@ -473,12 +481,24 @@ impl StorageService {
             }
         };
 
-        Ok(Self { backend })
+        Ok(Self {
+            backend,
+            presign_backend,
+        })
     }
 
     /// Create with a specific backend (for testing)
     pub fn new(backend: Arc<dyn StorageBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            presign_backend: None,
+        }
+    }
+
+    /// Presign-capable handle for the underlying object store, or `None` when
+    /// the backend cannot issue presigned URLs (filesystem / test backends).
+    pub fn presign_backend(&self) -> Option<Arc<dyn crate::storage::StorageBackend>> {
+        self.presign_backend.clone()
     }
 
     /// Calculate SHA-256 hash of content
@@ -1004,15 +1024,21 @@ mod tests {
         std::env::remove_var("GCS_PROJECT_ID");
         std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
 
-        let config = minimal_config("gcs");
-        let result = GcsBackendWrapper::from_config(&config).await;
+        let gcs_config = crate::storage::gcs::GcsConfig::from_env();
+        let result = match gcs_config {
+            Ok(cfg) => crate::storage::gcs::GcsBackend::new(cfg).await,
+            Err(e) => Err(e),
+        };
         std::env::remove_var("GCS_BUCKET");
 
         assert!(
             result.is_ok(),
-            "GcsBackendWrapper should construct without error in ADC mode"
+            "GcsBackend should construct without error in ADC mode"
         );
-        let wrapper = result.unwrap();
+        let inner = Arc::new(result.unwrap());
+        let wrapper = GcsBackendWrapper {
+            inner: Arc::clone(&inner),
+        };
         assert_eq!(wrapper.inner.bucket(), "wrapper-test-bucket");
     }
 
