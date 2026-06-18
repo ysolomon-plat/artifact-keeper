@@ -1212,14 +1212,8 @@ async fn serve_file(
                             let normalized = PypiHandler::normalize_name(project);
                             let local_cache_path = format!("simple/{}/{}", normalized, filename);
 
-                            // #1555: proxy_fetch_or_redirect handles presigned redirect
-                            // on a cache hit (or streaming if presigning is unavailable)
-                            // in a single freshness check. Falls through to the PyPI-specific
-                            // upstream fetch on a cache miss (proxy_fetch uses the generic
-                            // path which can't resolve PyPI CDN URLs).
-                            if let Ok(resp) = proxy_helpers::proxy_fetch_or_redirect(
+                            if let Some(result) = proxy_helpers::proxy_check_cache_streaming(
                                 proxy,
-                                state,
                                 member.id,
                                 &member.key,
                                 upstream_url,
@@ -1227,7 +1221,7 @@ async fn serve_file(
                             )
                             .await
                             {
-                                return Ok(resp);
+                                return Ok(build_streaming_file_response(filename, result));
                             }
 
                             match fetch_from_pypi_remote_streaming(
