@@ -6877,7 +6877,12 @@ SHA256:
             .expect("write_buffered must succeed");
 
         let written = capture.keys_snapshot();
-        assert_eq!(written.len(), 2, "expected content write + metadata write, got {:?}", written);
+        assert_eq!(
+            written.len(),
+            2,
+            "expected content write + metadata write, got {:?}",
+            written
+        );
         assert_eq!(
             written[0], keys.content,
             "first write must be the raw content key from CacheKeys::derive"
