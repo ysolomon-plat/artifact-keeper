@@ -20,6 +20,49 @@ fn block_unscanned_violated(block_unscanned: bool, scan_state: ScanState) -> boo
     block_unscanned && scan_state.is_unscanned()
 }
 
+/// Allowed values for `scan_policies.max_severity`, mirroring the DB CHECK
+/// constraint in `migrations/022_security_scanning.sql`.
+///
+/// Note the set deliberately excludes `info` even though the scanner-side
+/// [`Severity`] enum has an `Info` variant: `max_severity` is a blocking
+/// threshold, and gating downloads on purely informational findings is never
+/// a meaningful policy, so the schema never allowed it.
+pub const ALLOWED_MAX_SEVERITIES: [&str; 4] = ["critical", "high", "medium", "low"];
+
+/// Normalize and validate a client-supplied `max_severity` value (#2320).
+///
+/// Case-insensitive: `"Critical"` / `"HIGH"` are accepted and canonicalized
+/// to lowercase so they satisfy the DB CHECK constraint. Anything outside the
+/// allowed set returns [`AppError::Validation`] (400) with an actionable
+/// message. Before this existed the raw string went straight into the
+/// INSERT/UPDATE and a mis-cased or unknown value surfaced as a
+/// CHECK-constraint violation, i.e. an opaque 500 `DATABASE_ERROR`.
+fn normalize_max_severity(raw: &str) -> Result<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if ALLOWED_MAX_SEVERITIES.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err(AppError::Validation(format!(
+            "invalid max_severity '{raw}': must be one of critical, high, medium, low"
+        )))
+    }
+}
+
+/// Decision half of [`PolicyService::ensure_repository_exists`] (#2320): map
+/// the `EXISTS` query result onto Ok / 404-NotFound. Split out from the DB
+/// query so the contract — a missing FK target must surface as `NotFound`
+/// naming the repository id, never a raw FK-violation 500 — is pure and
+/// unit-testable.
+fn repository_exists_or_not_found(exists: bool, repository_id: Uuid) -> Result<()> {
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::NotFound(format!(
+            "Repository {repository_id} not found"
+        )))
+    }
+}
+
 pub struct PolicyService {
     db: PgPool,
 }
@@ -174,6 +217,23 @@ impl PolicyService {
     // CRUD
     // -----------------------------------------------------------------------
 
+    /// Verify a repository id points at an existing repository (#2320).
+    ///
+    /// Scan policies can be scoped to a repository; a stale or mistyped id
+    /// used to fall through to the `scan_policies_repository_id_fkey` FK
+    /// violation on INSERT and surface as a 500. Checking first lets us
+    /// return a proper 404.
+    async fn ensure_repository_exists(&self, repository_id: Uuid) -> Result<()> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM repositories WHERE id = $1)")
+                .bind(repository_id)
+                .fetch_one(&self.db)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+        repository_exists_or_not_found(exists, repository_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_policy(
         &self,
@@ -186,6 +246,14 @@ impl PolicyService {
         max_artifact_age_days: Option<i32>,
         require_signature: bool,
     ) -> Result<ScanPolicy> {
+        // #2320: validate inputs up front so a bad request comes back as a
+        // 4xx instead of tripping the DB CHECK / FK constraint and surfacing
+        // as an opaque 500 DATABASE_ERROR.
+        let max_severity = normalize_max_severity(max_severity)?;
+        if let Some(repo_id) = repository_id {
+            self.ensure_repository_exists(repo_id).await?;
+        }
+
         let policy: ScanPolicy = sqlx::query_as(
             r#"
             INSERT INTO scan_policies (name, repository_id, max_severity, block_unscanned, block_on_fail,
@@ -198,7 +266,7 @@ impl PolicyService {
         )
         .bind(name)
         .bind(repository_id)
-        .bind(max_severity)
+        .bind(&max_severity)
         .bind(block_unscanned)
         .bind(block_on_fail)
         .bind(min_staging_hours)
@@ -267,6 +335,10 @@ impl PolicyService {
         max_artifact_age_days: Option<i32>,
         require_signature: Option<bool>,
     ) -> Result<ScanPolicy> {
+        // #2320: same normalization as create_policy — a mis-cased or unknown
+        // max_severity on update used to trip the DB CHECK constraint (500).
+        let max_severity = max_severity.map(normalize_max_severity).transpose()?;
+
         let policy: ScanPolicy = sqlx::query_as(
             r#"
             UPDATE scan_policies
@@ -370,6 +442,176 @@ mod tests {
                 "gate disabled -> never a violation regardless of scan state"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // max_severity normalization (#2320)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_max_severity_accepts_canonical_values() {
+        for value in ALLOWED_MAX_SEVERITIES {
+            assert_eq!(
+                normalize_max_severity(value).unwrap(),
+                value,
+                "canonical lowercase value '{value}' must pass through unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_max_severity_canonicalizes_case_and_whitespace() {
+        // #2320 regression: "Critical" used to be forwarded verbatim to the
+        // INSERT, violate the lowercase CHECK constraint, and surface as a
+        // 500 DATABASE_ERROR. It must now normalize cleanly.
+        assert_eq!(normalize_max_severity("Critical").unwrap(), "critical");
+        assert_eq!(normalize_max_severity("HIGH").unwrap(), "high");
+        assert_eq!(normalize_max_severity("  Medium ").unwrap(), "medium");
+        assert_eq!(normalize_max_severity("LoW").unwrap(), "low");
+    }
+
+    #[test]
+    fn test_normalize_max_severity_rejects_unknown_values() {
+        // Unknown values must be a Validation error (400), never reach the DB.
+        for bad in ["severe", "none", "", "critical; DROP TABLE", "🔥"] {
+            match normalize_max_severity(bad) {
+                Err(AppError::Validation(msg)) => {
+                    assert!(
+                        msg.contains("max_severity"),
+                        "validation message should name the offending field, got: {msg}"
+                    );
+                }
+                other => {
+                    panic!("expected AppError::Validation for max_severity '{bad}', got: {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_normalize_max_severity_rejects_info() {
+        // The Severity enum has an Info variant but the scan_policies CHECK
+        // constraint deliberately excludes it — a blocking threshold of
+        // "info" would gate on purely informational findings. Keep rejecting
+        // it here so the API contract matches the schema.
+        assert!(matches!(
+            normalize_max_severity("info"),
+            Err(AppError::Validation(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // repository existence pre-check (#2320)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repository_exists_or_not_found_accepts_existing_repository() {
+        let repo_id = Uuid::new_v4();
+        assert!(
+            repository_exists_or_not_found(true, repo_id).is_ok(),
+            "an existing repository must pass the pre-check"
+        );
+    }
+
+    #[test]
+    fn test_repository_exists_or_not_found_maps_missing_repo_to_not_found() {
+        // #2320 regression: a stale/mistyped repository_id used to fall
+        // through to the scan_policies_repository_id_fkey violation on
+        // INSERT and surface as an opaque 500. The pre-check must turn it
+        // into a NotFound (404) that names the offending id.
+        let repo_id = Uuid::new_v4();
+        match repository_exists_or_not_found(false, repo_id) {
+            Err(AppError::NotFound(msg)) => {
+                assert!(
+                    msg.contains(&repo_id.to_string()),
+                    "NotFound message should name the repository id, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::NotFound for a missing repository, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // create/update entry-point validation ordering (#2320)
+    // -----------------------------------------------------------------------
+
+    /// A pool that never opens a connection (and gives up acquiring almost
+    /// immediately). Calling a service method with it proves where the DB
+    /// boundary sits: anything that returns `Validation` did so BEFORE any
+    /// DB round-trip, and anything that returns `Database` got past
+    /// validation and genuinely tried to reach the pool.
+    fn disconnected_service() -> PolicyService {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("connect_lazy should not fail");
+        PolicyService::new(pool)
+    }
+
+    #[tokio::test]
+    async fn test_create_policy_rejects_invalid_max_severity_before_touching_db() {
+        let svc = disconnected_service();
+        let err = svc
+            .create_policy("p", None, "bogus", false, false, None, None, false)
+            .await
+            .unwrap_err();
+        // Validation (not Database/PoolTimedOut) proves the reject happened
+        // before any DB round-trip — the pool cannot serve a connection.
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_create_policy_with_valid_severity_proceeds_to_repository_check() {
+        let svc = disconnected_service();
+        let err = svc
+            .create_policy(
+                "p",
+                Some(Uuid::new_v4()),
+                "Critical",
+                false,
+                false,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        // The mis-cased-but-known severity normalizes fine, so create must
+        // move on to the repository existence pre-check, whose EXISTS query
+        // is the first DB touch — surfacing here as a Database error.
+        assert!(matches!(err, AppError::Database(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_create_policy_unscoped_valid_input_reaches_insert() {
+        let svc = disconnected_service();
+        let err = svc
+            .create_policy("p", None, "high", true, true, Some(1), Some(30), true)
+            .await
+            .unwrap_err();
+        // No repository scope: nothing to pre-check, so the INSERT itself is
+        // the first DB touch.
+        assert!(matches!(err, AppError::Database(_)), "got: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_update_policy_rejects_invalid_max_severity_before_touching_db() {
+        let svc = disconnected_service();
+        let err = svc
+            .update_policy(
+                Uuid::new_v4(),
+                None,
+                Some("bogus"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got: {err:?}");
     }
 
     // -----------------------------------------------------------------------

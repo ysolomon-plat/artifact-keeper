@@ -17,7 +17,7 @@ use crate::error::{AppError, Result};
 use crate::models::user::{AuthProvider, User};
 use crate::services::audit_service::{
     api_token_audit_entry, audit_fire_and_forget, password_change_audit_entry,
-    sessions_invalidated_audit_entry, AuditAction,
+    sessions_invalidated_audit_entry, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::auth_service::{
     invalidate_user_token_cache_entries, invalidate_user_tokens, AuthService,
@@ -386,6 +386,21 @@ pub async fn create_user(
         .event_bus
         .emit("user.created", user.id, Some(auth.username.clone()));
 
+    // Audit trail (#2366): admin created a user. Actor = acting admin
+    // (`user_id`), target = the new user (`resource`). Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::UserCreated, ResourceType::User)
+            .user(auth.user_id)
+            .resource(user.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "username": user.username,
+                "is_admin": user.is_admin,
+            })),
+    )
+    .await;
+
     Ok(Json(CreateUserResponse {
         user: user_to_response(user),
         generated_password: if auto_generated { Some(password) } else { None },
@@ -571,6 +586,20 @@ pub async fn update_user(
         .event_bus
         .emit("user.updated", user.id, Some(auth.username.clone()));
 
+    // Audit trail (#2366): admin updated a user record. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::UserUpdated, ResourceType::User)
+            .user(auth.user_id)
+            .resource(user.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "is_admin": user.is_admin,
+                "is_active": user.is_active,
+            })),
+    )
+    .await;
+
     Ok(Json(user_to_response(user)))
 }
 
@@ -633,6 +662,16 @@ pub async fn delete_user(
     state
         .event_bus
         .emit("user.deleted", id, Some(auth.username.clone()));
+
+    // Audit trail (#2366): admin deleted a user. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::UserDeleted, ResourceType::User)
+            .user(auth.user_id)
+            .resource(id)
+            .details(serde_json::json!({ "actor_id": auth.user_id.to_string() })),
+    )
+    .await;
 
     Ok(())
 }
@@ -739,6 +778,20 @@ pub async fn assign_role(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
+    // Audit trail (#2366): role granted to a user — a permission change.
+    // Actor = acting admin, target = the user receiving the role. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RoleAssigned, ResourceType::User)
+            .user(auth.user_id)
+            .resource(id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "role_id": payload.role_id.to_string(),
+            })),
+    )
+    .await;
+
     Ok(())
 }
 
@@ -778,11 +831,25 @@ pub async fn revoke_role(
         return Err(AppError::NotFound("Role assignment not found".to_string()));
     }
 
+    // Audit trail (#2366): role revoked from a user — a permission change.
+    // Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RoleRevoked, ResourceType::User)
+            .user(auth.user_id)
+            .resource(user_id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "role_id": role_id.to_string(),
+            })),
+    )
+    .await;
+
     Ok(())
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateApiTokenRequest {
+pub struct CreateUserApiTokenRequest {
     pub name: String,
     pub scopes: Vec<String>,
     pub expires_in_days: Option<i64>,
@@ -882,7 +949,7 @@ async fn list_user_tokens_inner(
     params(
         ("id" = Uuid, Path, description = "User ID"),
     ),
-    request_body = CreateApiTokenRequest,
+    request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
         (status = 403, description = "Cannot create tokens for other users"),
@@ -893,7 +960,7 @@ pub async fn create_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<CreateApiTokenRequest>,
+    Json(payload): Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Users can only create tokens for themselves unless admin
     auth.require_self_or_admin(id, "Cannot create tokens for other users")?;
@@ -908,7 +975,7 @@ async fn create_api_token_inner(
     state: &SharedState,
     auth: &AuthExtension,
     id: Uuid,
-    payload: CreateApiTokenRequest,
+    payload: CreateUserApiTokenRequest,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     // Refuse admin-class scopes from non-admin callers. See
     // `token_service::ADMIN_ONLY_SCOPES` for the policy rationale —
@@ -1561,7 +1628,7 @@ pub async fn list_current_user_tokens(
     context_path = "/api/v1/users",
     tag = "users",
     operation_id = "create_current_user_api_token",
-    request_body = CreateApiTokenRequest,
+    request_body = CreateUserApiTokenRequest,
     responses(
         (status = 200, description = "API token created successfully", body = ApiTokenCreatedResponse),
         (status = 403, description = "Requested scopes require administrator privileges"),
@@ -1571,7 +1638,7 @@ pub async fn list_current_user_tokens(
 pub async fn create_current_user_api_token(
     State(state): State<SharedState>,
     Extension(auth): Extension<AuthExtension>,
-    Json(payload): Json<CreateApiTokenRequest>,
+    Json(payload): Json<CreateUserApiTokenRequest>,
 ) -> Result<Json<ApiTokenCreatedResponse>> {
     create_api_token_inner(&state, &auth, auth.user_id, payload).await
 }
@@ -1661,7 +1728,7 @@ pub async fn change_current_user_password(
         RoleResponse,
         RoleListResponse,
         AssignRoleRequest,
-        CreateApiTokenRequest,
+        CreateUserApiTokenRequest,
         ApiTokenResponse,
         ApiTokenCreatedResponse,
         ApiTokenListResponse,
@@ -2025,7 +2092,7 @@ mod tests {
     #[test]
     fn test_create_api_token_request_deserialize() {
         let json = r#"{"name":"CI token","scopes":["read","deploy"],"expires_in_days":90}"#;
-        let req: CreateApiTokenRequest = serde_json::from_str(json).unwrap();
+        let req: CreateUserApiTokenRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name, "CI token");
         assert_eq!(req.scopes, vec!["read", "deploy"]);
         assert_eq!(req.expires_in_days, Some(90));
@@ -2034,7 +2101,7 @@ mod tests {
     #[test]
     fn test_create_api_token_request_no_expiry() {
         let json = r#"{"name":"permanent","scopes":["*"]}"#;
-        let req: CreateApiTokenRequest = serde_json::from_str(json).unwrap();
+        let req: CreateUserApiTokenRequest = serde_json::from_str(json).unwrap();
         assert!(req.expires_in_days.is_none());
     }
 

@@ -30,10 +30,165 @@ pub fn router() -> Router<SharedState> {
         .route("/backups/:id/cancel", post(cancel_backup))
         .route("/settings", get(get_settings).post(update_settings))
         .route("/stats", get(get_system_stats))
+        .route("/downloads", get(list_downloads))
+        .route("/downloads/by-ip/:ip", get(list_downloads_by_ip))
+        .route("/downloads/by-user/:user_id", get(list_downloads_by_user))
         .route("/cleanup", post(run_cleanup))
         .route("/reindex", post(trigger_reindex))
         .route("/rescan-for-inventory", post(rescan_for_inventory))
         .route("/storage-backends", get(list_storage_backends))
+        .route("/audit", get(list_audit_logs))
+}
+
+// ---------------------------------------------------------------------------
+// Audit log query endpoint (#2366 functional audit log)
+// ---------------------------------------------------------------------------
+
+/// Default page size for the audit-log query when the caller does not specify.
+const AUDIT_DEFAULT_PER_PAGE: u32 = 50;
+/// Hard cap on page size so a single query cannot pull an unbounded slice.
+const AUDIT_MAX_PER_PAGE: u32 = 200;
+
+/// Normalize/clamp audit-query pagination into a `(offset, limit, page,
+/// per_page)` tuple.
+///
+/// Pure (no I/O) so the coverage gate exercises the pagination arithmetic even
+/// where Postgres is unavailable. `page` is 1-based and floored at 1;
+/// `per_page` defaults to [`AUDIT_DEFAULT_PER_PAGE`] and is clamped to
+/// `1..=AUDIT_MAX_PER_PAGE`.
+pub(crate) fn audit_page_bounds(page: Option<u32>, per_page: Option<u32>) -> (i64, i64, u32, u32) {
+    let page = page.unwrap_or(1).max(1);
+    let per_page = per_page
+        .unwrap_or(AUDIT_DEFAULT_PER_PAGE)
+        .clamp(1, AUDIT_MAX_PER_PAGE);
+    let offset = i64::from(page - 1) * i64::from(per_page);
+    (offset, i64::from(per_page), page, per_page)
+}
+
+/// Filters for `GET /api/v1/admin/audit`.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct AuditLogQuery {
+    /// Filter by acting/subject user id.
+    pub user_id: Option<Uuid>,
+    /// Filter by action string (e.g. `LOGIN`, `USER_CREATED`, `ARTIFACT_DOWNLOADED`).
+    pub action: Option<String>,
+    /// Filter by resource type (e.g. `user`, `repository`, `artifact`).
+    pub resource_type: Option<String>,
+    /// Filter by the affected resource id.
+    pub resource_id: Option<Uuid>,
+    /// Filter by exact correlation ID (#2414) — the request's
+    /// `X-Correlation-ID` / trace ID as stored on each audit event.
+    pub correlation_id: Option<String>,
+    /// Inclusive lower time bound (RFC 3339).
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Inclusive upper time bound (RFC 3339).
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+    /// 1-based page index (default 1).
+    pub page: Option<u32>,
+    /// Page size (default 50, max 200).
+    pub per_page: Option<u32>,
+}
+
+/// A single audit-log row in a query response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuditLogItem {
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    /// Username of the acting user, embedded server-side (#2392). `null` for
+    /// system/non-user actors and for actors that have since been deleted.
+    pub actor_username: Option<String>,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+    pub details: Option<serde_json::Value>,
+    pub ip_address: Option<String>,
+    /// Request correlation ID (#2414): a string — caller-supplied values and
+    /// W3C trace IDs are not UUIDs.
+    pub correlation_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::services::audit_service::AuditLogEntryWithActor> for AuditLogItem {
+    fn from(e: crate::services::audit_service::AuditLogEntryWithActor) -> Self {
+        Self {
+            id: e.id,
+            user_id: e.user_id,
+            actor_username: e.actor_username,
+            action: e.action,
+            resource_type: e.resource_type,
+            resource_id: e.resource_id,
+            details: e.details,
+            ip_address: e.ip_address,
+            correlation_id: e.correlation_id,
+            created_at: e.created_at,
+        }
+    }
+}
+
+/// Paginated audit-log query response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuditLogListResponse {
+    pub items: Vec<AuditLogItem>,
+    pub total: i64,
+    pub page: u32,
+    pub per_page: u32,
+}
+
+/// Query the audit log (admin only).
+///
+/// Returns recorded audit events ordered newest-first, filtered by any
+/// combination of actor/user, action, resource type/id, and time range, with
+/// page/per_page pagination. Backed by the `audit_log` table and
+/// [`AuditService::query`]; admin-only both via the `/admin` `admin_middleware`
+/// and a defense-in-depth check here (#2366).
+#[utoipa::path(
+    get,
+    path = "/audit",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(AuditLogQuery),
+    responses(
+        (status = 200, description = "Audit events", body = AuditLogListResponse),
+        (status = 403, description = "Admin privileges required"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_audit_logs(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<Json<AuditLogListResponse>> {
+    // Defense-in-depth: the `/admin` nest already enforces `admin_middleware`,
+    // but never rely on a single gate for a security-sensitive read.
+    if !auth.is_admin {
+        return Err(AppError::Authorization(
+            "Admin privileges required".to_string(),
+        ));
+    }
+
+    let (offset, limit, page, per_page) = audit_page_bounds(query.page, query.per_page);
+
+    let audit_service = crate::services::audit_service::AuditService::new(state.db.clone());
+    let (entries, total) = audit_service
+        .query(
+            query.user_id,
+            query.action.as_deref(),
+            query.resource_type.as_deref(),
+            query.resource_id,
+            query.correlation_id.as_deref(),
+            query.from,
+            query.to,
+            offset,
+            limit,
+        )
+        .await?;
+
+    Ok(Json(AuditLogListResponse {
+        items: entries.into_iter().map(AuditLogItem::from).collect(),
+        total,
+        page,
+        per_page,
+    }))
 }
 
 /// List available storage backends.
@@ -429,6 +584,11 @@ pub async fn delete_backup(
 pub struct SystemSettings {
     pub storage_backend: String,
     pub storage_path: String,
+    /// Read-only deployment environment name, sourced from the `ENVIRONMENT`
+    /// config value. Defaulted on deserialization so it is not required in the
+    /// update-settings request body.
+    #[serde(default)]
+    pub environment: String,
     pub allow_anonymous_download: bool,
     pub max_upload_size_bytes: i64,
     pub retention_days: i32,
@@ -472,6 +632,7 @@ pub async fn get_settings(State(state): State<SharedState>) -> Result<Json<Syste
     let mut result = SystemSettings {
         storage_backend: state.config.storage_backend.clone(),
         storage_path: state.config.storage_path.clone(),
+        environment: state.config.environment.clone(),
         allow_anonymous_download: false,
         max_upload_size_bytes: 100 * 1024 * 1024, // 100MB default
         retention_days: 365,
@@ -661,6 +822,234 @@ pub async fn get_system_stats(State(state): State<SharedState>) -> Result<Json<S
         active_peers: active_edge_count,
         pending_sync_tasks: pending_sync_count,
     }))
+}
+
+/// Query parameters for the download-telemetry listing (#2365).
+#[derive(Debug, Default, Deserialize, ToSchema, IntoParams)]
+pub struct ListDownloadsQuery {
+    /// Filter to downloads of one artifact.
+    pub artifact_id: Option<Uuid>,
+    /// Filter to downloads by one user.
+    pub user_id: Option<Uuid>,
+    /// Filter to downloads from one client IP (exact match).
+    pub ip: Option<String>,
+    /// Inclusive lower bound on `downloaded_at` (RFC 3339).
+    pub from: Option<String>,
+    /// Inclusive upper bound on `downloaded_at` (RFC 3339).
+    pub to: Option<String>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+}
+
+/// One attributed download event.
+#[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
+pub struct DownloadRecord {
+    pub artifact_id: Uuid,
+    pub user_id: Option<Uuid>,
+    /// Username of the downloader, when the download was authenticated and
+    /// the user still exists.
+    pub username: Option<String>,
+    /// Resolved client IP; NULL for legacy rows and unresolvable clients.
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+    pub downloaded_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DownloadListResponse {
+    pub downloads: Vec<DownloadRecord>,
+    pub total: i64,
+    pub page: u32,
+    pub per_page: u32,
+}
+
+/// Parse an optional RFC 3339 query timestamp, rejecting malformed input.
+/// Shared with the blast-radius endpoints (`admin_security`, #2364).
+pub(crate) fn parse_rfc3339_bound(
+    value: Option<&str>,
+    name: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    value
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .map_err(|e| AppError::Validation(format!("invalid `{name}` timestamp: {e}")))
+        })
+        .transpose()
+}
+
+/// Append the shared WHERE clauses for the download-telemetry queries.
+fn push_download_filters<'a>(
+    builder: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>,
+    query: &'a ListDownloadsQuery,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    builder.push(" WHERE TRUE");
+    if let Some(artifact_id) = query.artifact_id {
+        builder.push(" AND d.artifact_id = ").push_bind(artifact_id);
+    }
+    if let Some(user_id) = query.user_id {
+        builder.push(" AND d.user_id = ").push_bind(user_id);
+    }
+    if let Some(ip) = &query.ip {
+        builder.push(" AND d.ip_address = ").push_bind(ip);
+    }
+    if let Some(from) = from {
+        builder.push(" AND d.downloaded_at >= ").push_bind(from);
+    }
+    if let Some(to) = to {
+        builder.push(" AND d.downloaded_at <= ").push_bind(to);
+    }
+}
+
+/// Shared listing core for the three download-telemetry endpoints.
+async fn query_downloads(
+    db: &sqlx::PgPool,
+    query: &ListDownloadsQuery,
+) -> Result<DownloadListResponse> {
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
+    let offset = ((page - 1) * per_page) as i64;
+    let from = parse_rfc3339_bound(query.from.as_deref(), "from")?;
+    let to = parse_rfc3339_bound(query.to.as_deref(), "to")?;
+
+    let mut count_builder = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM download_statistics d");
+    push_download_filters(&mut count_builder, query, from, to);
+    let total: i64 = count_builder
+        .build_query_scalar()
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut builder = sqlx::QueryBuilder::new(
+        "SELECT d.artifact_id, d.user_id, u.username, d.ip_address, d.user_agent, \
+         d.downloaded_at \
+         FROM download_statistics d LEFT JOIN users u ON u.id = d.user_id",
+    );
+    push_download_filters(&mut builder, query, from, to);
+    builder
+        .push(" ORDER BY d.downloaded_at DESC LIMIT ")
+        .push_bind(per_page as i64)
+        .push(" OFFSET ")
+        .push_bind(offset);
+    let downloads: Vec<DownloadRecord> = builder
+        .build_query_as()
+        .fetch_all(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+    Ok(DownloadListResponse {
+        downloads,
+        total,
+        page,
+        per_page,
+    })
+}
+
+/// List attributed downloads (client IP + user), filterable by artifact,
+/// user, IP, and time range (#2365). Admin-only: download attribution is
+/// sensitive.
+#[utoipa::path(
+    get,
+    path = "/downloads",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    params(ListDownloadsQuery),
+    responses(
+        (status = 200, description = "Attributed download events", body = DownloadListResponse),
+        (status = 400, description = "Invalid filter parameter"),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_downloads(
+    State(state): State<SharedState>,
+    Query(query): Query<ListDownloadsQuery>,
+) -> Result<Json<DownloadListResponse>> {
+    Ok(Json(query_downloads(&state.db, &query).await?))
+}
+
+/// Downloads originating from one client IP: "what did this network
+/// location pull?" (#2365).
+#[utoipa::path(
+    get,
+    path = "/downloads/by-ip/{ip}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    // NOTE: enumerate the query filters instead of `params(ListDownloadsQuery)`
+    // so the `ip` filter is not emitted a second time alongside the `{ip}` path
+    // parameter. A duplicate parameter name (path + query) is valid OpenAPI but
+    // makes the openapi-generator Rust client generate the path parameter as
+    // `Option<&str>`, which fails to compile. The path IP overrides the filter
+    // anyway (see handler body), so dropping the redundant `ip` query is a no-op
+    // for callers.
+    params(
+        ("ip" = String, Path, description = "Client IP address"),
+        ("artifact_id" = Option<Uuid>, Query, description = "Filter to downloads of one artifact"),
+        ("user_id" = Option<Uuid>, Query, description = "Filter to downloads by one user"),
+        ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
+    ),
+    responses(
+        (status = 200, description = "Downloads from the IP", body = DownloadListResponse),
+        (status = 400, description = "Invalid IP address"),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_downloads_by_ip(
+    State(state): State<SharedState>,
+    Path(ip): Path<String>,
+    Query(query): Query<ListDownloadsQuery>,
+) -> Result<Json<DownloadListResponse>> {
+    let ip: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| AppError::Validation("invalid IP address".to_string()))?;
+    let query = ListDownloadsQuery {
+        ip: Some(ip.to_string()),
+        ..query
+    };
+    Ok(Json(query_downloads(&state.db, &query).await?))
+}
+
+/// Downloads performed by one user: "what did this user pull?" (#2365).
+#[utoipa::path(
+    get,
+    path = "/downloads/by-user/{user_id}",
+    context_path = "/api/v1/admin",
+    tag = "admin",
+    // See list_downloads_by_ip: enumerate the query filters so the `user_id`
+    // filter is not emitted alongside the `{user_id}` path parameter (a
+    // duplicate name breaks the openapi-generator Rust client). The path
+    // user_id overrides the filter anyway.
+    params(
+        ("user_id" = Uuid, Path, description = "User id"),
+        ("artifact_id" = Option<Uuid>, Query, description = "Filter to downloads of one artifact"),
+        ("ip" = Option<String>, Query, description = "Filter to downloads from one client IP (exact match)"),
+        ("from" = Option<String>, Query, description = "Inclusive lower bound on downloaded_at (RFC 3339)"),
+        ("to" = Option<String>, Query, description = "Inclusive upper bound on downloaded_at (RFC 3339)"),
+        ("page" = Option<u32>, Query),
+        ("per_page" = Option<u32>, Query),
+    ),
+    responses(
+        (status = 200, description = "Downloads by the user", body = DownloadListResponse),
+        (status = 403, description = "Admin privileges required")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_downloads_by_user(
+    State(state): State<SharedState>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<ListDownloadsQuery>,
+) -> Result<Json<DownloadListResponse>> {
+    let query = ListDownloadsQuery {
+        user_id: Some(user_id),
+        ..query
+    };
+    Ok(Json(query_downloads(&state.db, &query).await?))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -963,10 +1352,14 @@ pub async fn rescan_for_inventory(
         get_settings,
         update_settings,
         get_system_stats,
+        list_downloads,
+        list_downloads_by_ip,
+        list_downloads_by_user,
         run_cleanup,
         trigger_reindex,
         rescan_for_inventory,
         list_storage_backends,
+        list_audit_logs,
     ),
     components(schemas(
         ListBackupsQuery,
@@ -977,11 +1370,16 @@ pub async fn rescan_for_inventory(
         RestoreResponse,
         SystemSettings,
         SystemStats,
+        ListDownloadsQuery,
+        DownloadRecord,
+        DownloadListResponse,
         CleanupRequest,
         CleanupResponse,
         ReindexResponse,
         RescanForInventoryRequest,
         RescanForInventoryResponse,
+        AuditLogItem,
+        AuditLogListResponse,
     ))
 )]
 pub struct AdminApiDoc;
@@ -989,6 +1387,55 @@ pub struct AdminApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // audit_page_bounds (#2366) — pure pagination arithmetic, no DB required so
+    // the coverage gate exercises it even without Postgres.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_audit_page_bounds_defaults() {
+        // No page/per_page -> page 1, default page size, offset 0.
+        let (offset, limit, page, per_page) = audit_page_bounds(None, None);
+        assert_eq!(offset, 0);
+        assert_eq!(limit, AUDIT_DEFAULT_PER_PAGE as i64);
+        assert_eq!(page, 1);
+        assert_eq!(per_page, AUDIT_DEFAULT_PER_PAGE);
+    }
+
+    #[test]
+    fn test_audit_page_bounds_computes_offset() {
+        // Page 3 at 25/page -> offset 50.
+        let (offset, limit, page, per_page) = audit_page_bounds(Some(3), Some(25));
+        assert_eq!(offset, 50);
+        assert_eq!(limit, 25);
+        assert_eq!(page, 3);
+        assert_eq!(per_page, 25);
+    }
+
+    #[test]
+    fn test_audit_page_bounds_floors_page_at_one() {
+        // Page 0 must not underflow (page-1) or produce a negative offset.
+        let (offset, _limit, page, _pp) = audit_page_bounds(Some(0), Some(10));
+        assert_eq!(offset, 0);
+        assert_eq!(page, 1);
+    }
+
+    #[test]
+    fn test_audit_page_bounds_clamps_per_page_to_max() {
+        // An over-large per_page is clamped to the hard cap.
+        let (_offset, limit, _page, per_page) = audit_page_bounds(Some(1), Some(10_000));
+        assert_eq!(limit, AUDIT_MAX_PER_PAGE as i64);
+        assert_eq!(per_page, AUDIT_MAX_PER_PAGE);
+    }
+
+    #[test]
+    fn test_audit_page_bounds_clamps_zero_per_page_to_one() {
+        // per_page = 0 would return an empty page forever; clamp up to 1.
+        let (_offset, limit, _page, per_page) = audit_page_bounds(Some(1), Some(0));
+        assert_eq!(limit, 1);
+        assert_eq!(per_page, 1);
+    }
 
     // -----------------------------------------------------------------------
     // parse_backup_type
@@ -1097,6 +1544,7 @@ mod tests {
         let settings = SystemSettings {
             storage_backend: "filesystem".to_string(),
             storage_path: "/data/artifacts".to_string(),
+            environment: "development".to_string(),
             allow_anonymous_download: false,
             max_upload_size_bytes: 100 * 1024 * 1024,
             retention_days: 365,
@@ -1111,6 +1559,7 @@ mod tests {
         assert_eq!(settings.backup_retention_count, 10);
         assert_eq!(settings.edge_stale_threshold_minutes, 5);
         assert_eq!(settings.storage_backend, "filesystem");
+        assert_eq!(settings.environment, "development");
     }
 
     #[test]
@@ -1118,6 +1567,7 @@ mod tests {
         let settings = SystemSettings {
             storage_backend: "s3".to_string(),
             storage_path: "/data/artifacts".to_string(),
+            environment: "staging".to_string(),
             allow_anonymous_download: true,
             max_upload_size_bytes: 500_000_000,
             retention_days: 30,
@@ -1133,6 +1583,66 @@ mod tests {
         assert_eq!(parsed.audit_retention_days, 7);
         assert_eq!(parsed.backup_retention_count, 5);
         assert_eq!(parsed.edge_stale_threshold_minutes, 10);
+        assert_eq!(parsed.environment, "staging");
+    }
+
+    /// Regression: the settings DTO must serialize an `environment` field so
+    /// the admin UI can render the true deployment environment instead of a
+    /// hardcoded value. This fails if the field is dropped from the response.
+    #[test]
+    fn test_system_settings_serializes_environment() {
+        let settings = SystemSettings {
+            storage_backend: "filesystem".to_string(),
+            storage_path: "/data/artifacts".to_string(),
+            environment: "production".to_string(),
+            allow_anonymous_download: false,
+            max_upload_size_bytes: 100 * 1024 * 1024,
+            retention_days: 365,
+            audit_retention_days: 90,
+            backup_retention_count: 10,
+            edge_stale_threshold_minutes: 5,
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(
+            json.contains("\"environment\":\"production\""),
+            "settings response must expose environment: {json}"
+        );
+    }
+
+    /// Regression: `serde(default)` on `environment` keeps it optional in the
+    /// update-settings request body, so older clients that omit it still
+    /// deserialize (defaulting to an empty string).
+    #[test]
+    fn test_system_settings_environment_defaults_when_absent() {
+        let json = r#"{
+            "storage_backend": "filesystem",
+            "storage_path": "/data/artifacts",
+            "allow_anonymous_download": false,
+            "max_upload_size_bytes": 104857600,
+            "retention_days": 365,
+            "audit_retention_days": 90,
+            "backup_retention_count": 10,
+            "edge_stale_threshold_minutes": 5
+        }"#;
+        let parsed: SystemSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.environment, "");
+    }
+
+    /// Regression (DB-backed, no-op without `DATABASE_URL`): `get_settings`
+    /// must thread `config.environment` into the response. The test config
+    /// defaults this to "development", matching the runtime default.
+    #[tokio::test]
+    async fn test_get_settings_exposes_config_environment() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let state = tdh::build_state(pool, "/tmp/admin-settings-env");
+
+        let Json(settings) = get_settings(State(state)).await.unwrap();
+
+        assert_eq!(settings.environment, "development");
     }
 
     // -----------------------------------------------------------------------
@@ -1296,5 +1806,258 @@ mod tests {
     fn test_settings_row_parsing_fallback_on_wrong_type() {
         let val = serde_json::json!("not a number");
         assert_eq!(val.as_i64().unwrap_or(100), 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // #2366: GET /admin/audit — admin can read recorded events; a non-admin is
+    // refused by the handler's defense-in-depth check. Skips without
+    // `DATABASE_URL`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_audit_logs_admin_reads_and_non_admin_forbidden_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::Extension as AxumExtension;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+
+        // Seed one audit event keyed by a unique resource id.
+        let resource_id = Uuid::new_v4();
+        AuditService::new(pool.clone())
+            .log(
+                AuditEntry::new(AuditAction::UserCreated, ResourceType::User)
+                    .user(user_id)
+                    .resource(resource_id),
+            )
+            .await
+            .expect("seed audit event");
+
+        let state = tdh::build_state(pool.clone(), "/tmp");
+
+        // Admin caller -> 200, and our event is returned when filtered.
+        let mut admin_auth = tdh::make_auth(user_id, &username);
+        admin_auth.is_admin = true;
+        let app = router()
+            .with_state(state.clone())
+            .layer(AxumExtension::<AuthExtension>(admin_auth));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/audit?resource_id={}", resource_id))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = tdh::send(app, req).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin can read audit; body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["items"][0]["action"], "USER_CREATED");
+        assert_eq!(v["items"][0]["resource_id"], resource_id.to_string());
+        // #2392: the actor's username is embedded server-side so the UI does
+        // not have to client-side-join against /admin/users.
+        assert_eq!(v["items"][0]["actor_username"], username);
+
+        // Non-admin caller -> 403 (handler defense-in-depth, independent of the
+        // `/admin` admin_middleware which is not mounted in this unit router).
+        let non_admin = tdh::make_auth(user_id, &username);
+        let app2 = router()
+            .with_state(state)
+            .layer(AxumExtension::<AuthExtension>(non_admin));
+        let req2 = Request::builder()
+            .method(Method::GET)
+            .uri("/audit")
+            .body(Body::empty())
+            .unwrap();
+        let (status2, _) = tdh::send(app2, req2).await;
+        assert_eq!(status2, StatusCode::FORBIDDEN);
+
+        let _ = sqlx::query("DELETE FROM audit_log WHERE resource_id = $1")
+            .bind(resource_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // download telemetry (#2365)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_rfc3339_bound_accepts_valid_and_none() {
+        assert_eq!(parse_rfc3339_bound(None, "from").unwrap(), None);
+        let parsed = parse_rfc3339_bound(Some("2026-07-01T00:00:00Z"), "from")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-07-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn test_parse_rfc3339_bound_rejects_malformed() {
+        let err = parse_rfc3339_bound(Some("yesterday"), "to").unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn test_query_downloads_filters_by_ip_user_and_artifact() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'dl-telemetry', '1.0.0', 10, $3, 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("dl-telemetry/{}.bin", Uuid::new_v4()))
+        .bind(format!("{:0>64}", "1"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+
+        // One authenticated download from 203.0.113.10, one anonymous from
+        // 203.0.113.11.
+        let ctx_authed = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: Some("203.0.113.10".parse().unwrap()),
+            user_id: Some(user_id),
+            user_agent: Some("admin-dl-test/1.0".to_string()),
+        };
+        let ctx_anon = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: Some("203.0.113.11".parse().unwrap()),
+            user_id: None,
+            user_agent: None,
+        };
+        crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_authed).await;
+        crate::services::artifact_service::record_download(&pool, artifact_id, &ctx_anon).await;
+
+        // Filter by artifact: both rows.
+        let by_artifact = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query by artifact");
+        assert_eq!(by_artifact.total, 2);
+        assert_eq!(by_artifact.downloads.len(), 2);
+
+        // Filter by IP: only the authenticated row, with the username joined.
+        let by_ip = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                ip: Some("203.0.113.10".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query by ip");
+        assert_eq!(by_ip.total, 1);
+        let row = &by_ip.downloads[0];
+        assert_eq!(row.user_id, Some(user_id));
+        assert_eq!(row.username.as_deref(), Some(username.as_str()));
+        assert_eq!(row.ip_address.as_deref(), Some("203.0.113.10"));
+        assert_eq!(row.user_agent.as_deref(), Some("admin-dl-test/1.0"));
+
+        // Filter by user: only the authenticated row.
+        let by_user = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                user_id: Some(user_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query by user");
+        assert_eq!(by_user.total, 1);
+
+        // The anonymous row keeps a NULL user but a real IP.
+        let anon = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                ip: Some("203.0.113.11".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query anon row");
+        assert_eq!(anon.total, 1);
+        assert_eq!(anon.downloads[0].user_id, None);
+
+        // Pagination clamps per_page and honors page.
+        let paged = query_downloads(
+            &pool,
+            &ListDownloadsQuery {
+                artifact_id: Some(artifact_id),
+                page: Some(2),
+                per_page: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("paged query");
+        assert_eq!(paged.total, 2);
+        assert_eq!(paged.downloads.len(), 1);
+        assert_eq!(paged.page, 2);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_record_download_unresolvable_ip_is_null_not_sentinel() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let (user_id, _username) = tdh::create_user(&pool).await;
+        let (repo_id, _repo_key, _dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let artifact_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, 'dl-null-ip', '1.0.0', 10, $3, 'application/octet-stream', $2) \
+             RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("dl-null-ip/{}.bin", Uuid::new_v4()))
+        .bind(format!("{:0>64}", "2"))
+        .fetch_one(&pool)
+        .await
+        .expect("insert artifact");
+
+        crate::services::artifact_service::record_download(&pool, artifact_id, &Default::default())
+            .await;
+
+        let (ip, uid): (Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT ip_address, user_id FROM download_statistics WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("stats row");
+        assert_eq!(
+            ip, None,
+            "unresolvable client must record NULL, not 0.0.0.0"
+        );
+        assert_eq!(uid, None);
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
     }
 }

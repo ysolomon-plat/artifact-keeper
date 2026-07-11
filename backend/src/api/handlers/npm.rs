@@ -128,9 +128,9 @@ fn npm_metadata_compression_layer() -> CompressionLayer<impl Predicate> {
 // ---------------------------------------------------------------------------
 
 /// Buffering cap when caching a computed packument body. Packuments are
-/// bounded JSON; this matches the cap `dist_tags_get` already uses when it
-/// buffers the same responses.
-const NPM_PACKUMENT_BUFFER_CAP: usize = 32 * 1024 * 1024;
+/// bounded JSON; keep this aligned with the upstream npm metadata cap so
+/// large public packuments (for example `prisma`) can still be cached.
+const NPM_PACKUMENT_BUFFER_CAP: usize = proxy_helpers::LARGE_METADATA_MAX_BYTES;
 
 /// True when the client advertises `gzip` (or `*`) in `Accept-Encoding`, i.e.
 /// the metadata compression layer would have gzipped the response. Only gzip
@@ -431,7 +431,7 @@ async fn compute_and_store_packument(
         return Err(response);
     }
 
-    // STREAMING-EXEMPT: capped metadata read (a computed npm packument JSON, not an artifact blob); bounded to <=32 MiB via NPM_PACKUMENT_BUFFER_CAP so a hostile/broken upstream cannot OOM us; over-cap is surfaced as an error and left uncached; tracked under #1608
+    // STREAMING-EXEMPT: capped metadata read (a computed npm packument JSON, not an artifact blob); bounded to <=128 MiB via NPM_PACKUMENT_BUFFER_CAP so a hostile/broken upstream cannot OOM us; over-cap is surfaced as an error and left uncached; tracked under #1608
     let body_bytes = axum::body::to_bytes(response.into_body(), NPM_PACKUMENT_BUFFER_CAP)
         .await
         .map_err(|e| {
@@ -1822,21 +1822,23 @@ fn rewrite_and_respond_inner(
 async fn download_tarball(
     State(state): State<SharedState>,
     Path((repo_key, package, filename)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let package = normalize_package_name(&package);
     validate_package_name(&package)?;
-    serve_tarball(&state, &repo_key, &package, &filename).await
+    serve_tarball(&state, &repo_key, &package, &filename, &ctx).await
 }
 
 async fn download_scoped_tarball(
     State(state): State<SharedState>,
     Path((repo_key, scope, package, filename)): Path<(String, String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let scope = normalize_package_name(&scope);
     let package = normalize_package_name(&package);
     let full_name = format!("@{}/{}", scope, package);
     validate_package_name(&full_name)?;
-    serve_tarball(&state, &repo_key, &full_name, &filename).await
+    serve_tarball(&state, &repo_key, &full_name, &filename, &ctx).await
 }
 
 /// Fetch an npm tarball from a virtual member's local storage, matching
@@ -1934,6 +1936,7 @@ async fn serve_tarball(
     repo_key: &str,
     package_name: &str,
     filename: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_npm_repo(&state.db, repo_key).await?;
 
@@ -2160,12 +2163,7 @@ async fn serve_tarball(
         .map_err(map_storage_err)?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
     Ok(build_tarball_response_stream(
         stream,
@@ -4762,6 +4760,7 @@ mod tests {
                 "testpkg".to_string(),
                 "testpkg-1.0.0.tgz".to_string(),
             )),
+            Default::default(),
         )
         .await;
 
@@ -4863,6 +4862,7 @@ mod tests {
                     "bigpkg".to_string(),
                     "bigpkg-1.0.0.tgz".to_string(),
                 )),
+                Default::default(),
             )
             .await;
 
@@ -6189,6 +6189,7 @@ mod db_cov_tests {
             &fx.repo_key,
             package,
             &format!("{package}-9.9.9.tgz"),
+            &Default::default(),
         )
         .await;
         let aged = super::serve_tarball(
@@ -6196,6 +6197,7 @@ mod db_cov_tests {
             &fx.repo_key,
             package,
             &format!("{package}-1.0.0.tgz"),
+            &Default::default(),
         )
         .await;
 

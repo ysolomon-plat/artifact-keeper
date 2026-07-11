@@ -189,6 +189,10 @@ const AZURE_BLOCK_WARNING_THRESHOLD: usize = 40_000;
 const AZURE_PUT_BLOB_FROM_URL_MAX_SIZE: u64 = 5_000 * 1024 * 1024;
 const AZURE_COPY_SOURCE_URL_MAX_LEN: usize = 2 * 1024;
 
+/// How far to backdate a SAS token's signed start (st) to tolerate clock
+/// skew between this host and Azure storage (Azure's documented allowance).
+const SAS_CLOCK_SKEW_ALLOWANCE_MINUTES: i64 = 15;
+
 impl TokenCredentialProvider {
     /// Build a provider from environment variables.
     fn from_env(client: &reqwest::Client) -> Result<Self> {
@@ -894,6 +898,18 @@ impl AzureBackend {
         }
     }
 
+    /// URL for the health-check HEAD probe.
+    ///
+    /// Must be a read-authorized URL: in Shared Key mode `authorized_head`
+    /// adds no Authorization header (it expects a SAS URL), so a bare
+    /// `blob_url` yields an anonymous request that Azure answers with
+    /// 409 PublicAccessNotPermitted whenever public blob access is disabled
+    /// on the account — reporting storage as unhealthy regardless of its
+    /// real state.
+    fn health_probe_url(&self) -> Result<String> {
+        self.read_url(".health-probe", Duration::from_secs(60))
+    }
+
     /// Generate a SAS token for a blob (Shared Key mode only).
     ///
     /// Uses Service SAS with blob resource type.
@@ -919,10 +935,16 @@ impl AzureBackend {
 
         let now = Utc::now();
         let expiry = now + ChronoDuration::seconds(expires_in.as_secs() as i64);
+        // Backdate the start time to tolerate clock skew between this host
+        // and the Azure storage service (Azure's documented guidance is a
+        // 15-minute allowance). With st == now, a request arriving while
+        // Azure's clock is even a few milliseconds behind ours is rejected
+        // with 403 "Signature not valid in the specified time frame".
+        let start = now - ChronoDuration::minutes(SAS_CLOCK_SKEW_ALLOWANCE_MINUTES);
 
         let signed_version = "2021-06-08";
         let signed_resource = "b";
-        let signed_start = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let signed_start = start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let signed_expiry = expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let signed_protocol = "https";
 
@@ -1599,7 +1621,7 @@ impl StorageBackend for AzureBackend {
         // HEAD a sentinel blob path. A 404 is fine (proves the container is
         // reachable and credentials are accepted). Only transport-level or
         // authentication errors indicate an unhealthy backend.
-        let url = self.blob_url(".health-probe");
+        let url = self.health_probe_url()?;
         let response = self
             .authorized_head(&url)
             .await
@@ -1893,6 +1915,46 @@ mod tests {
         assert!(token.contains("spr=https"));
     }
 
+    /// Decode a datetime query parameter (st/se) out of a SAS token.
+    fn sas_param_datetime(token: &str, param: &str) -> chrono::DateTime<Utc> {
+        let encoded = token
+            .split(&format!("{}=", param))
+            .nth(1)
+            .and_then(|s| s.split('&').next())
+            .unwrap_or_else(|| panic!("token should contain {}=", param));
+        let raw = urlencoding::decode(encoded).unwrap();
+        chrono::DateTime::parse_from_rfc3339(&raw)
+            .unwrap_or_else(|e| panic!("{} should be RFC 3339, got {:?}: {}", param, raw, e))
+            .with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn test_sas_signed_start_backdated_for_clock_skew() {
+        let backend = create_test_backend().await;
+
+        let token = backend
+            .generate_sas_token("test/file.txt", Duration::from_secs(3600))
+            .unwrap();
+        let now = Utc::now();
+
+        let start = sas_param_datetime(&token, "st");
+        let backdate = now.signed_duration_since(start);
+        assert!(
+            backdate >= ChronoDuration::minutes(SAS_CLOCK_SKEW_ALLOWANCE_MINUTES - 1),
+            "signed start must be backdated ~{} minutes for clock skew, got {}",
+            SAS_CLOCK_SKEW_ALLOWANCE_MINUTES,
+            backdate
+        );
+        assert!(backdate <= ChronoDuration::minutes(SAS_CLOCK_SKEW_ALLOWANCE_MINUTES + 1));
+
+        // The expiry window is measured from now, not from the backdated
+        // start — backdating must not shorten (or extend) token lifetime.
+        let expiry = sas_param_datetime(&token, "se");
+        let lifetime = expiry.signed_duration_since(now);
+        assert!(lifetime >= ChronoDuration::minutes(59));
+        assert!(lifetime <= ChronoDuration::minutes(61));
+    }
+
     #[tokio::test]
     async fn test_sas_url_different_keys() {
         let backend = create_test_backend().await;
@@ -1916,6 +1978,34 @@ mod tests {
         assert!(url.starts_with(
             "https://testaccount.blob.core.windows.net/testcontainer/path/to/blob.dat?"
         ));
+    }
+
+    // ── Health probe URL ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_health_probe_url_is_signed_in_shared_key_mode() {
+        let backend = create_test_backend().await;
+
+        let url = backend.health_probe_url().unwrap();
+        assert!(url.contains(".health-probe"));
+        assert!(
+            url.contains("sig="),
+            "Shared Key mode must HEAD a SAS-signed URL; an unsigned HEAD is \
+             anonymous and fails with 409 when public blob access is disabled"
+        );
+        assert!(url.contains("sp=r"), "probe needs read permission");
+    }
+
+    #[test]
+    fn test_health_probe_url_is_bare_in_rbac_mode() {
+        let backend = create_rbac_backend(service_principal_cred());
+
+        let url = backend.health_probe_url().unwrap();
+        assert!(url.contains(".health-probe"));
+        assert!(
+            !url.contains("sig="),
+            "RBAC mode authorizes via bearer header, not SAS"
+        );
     }
 
     // ── Redirect support ─────────────────────────────────────────────────

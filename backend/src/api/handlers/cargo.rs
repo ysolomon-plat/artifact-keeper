@@ -820,6 +820,7 @@ async fn publish(
 async fn download(
     State(state): State<SharedState>,
     Path((repo_key, name, version)): Path<(String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
     let name_lower = name.to_lowercase();
@@ -999,12 +1000,7 @@ async fn download(
         .map_err(map_storage_err)?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, &ctx).await;
 
     let filename = format!("{}-{}.crate", name_lower, version);
 
@@ -1852,6 +1848,7 @@ mod tests {
     ) -> crate::models::repository::Repository {
         use crate::models::repository::{ReplicationPriority, Repository, RepositoryFormat};
         Repository {
+            versioning_enabled: false,
             id: uuid::Uuid::new_v4(),
             key: key.to_string(),
             name: key.to_string(),

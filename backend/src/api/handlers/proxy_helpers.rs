@@ -2249,7 +2249,7 @@ pub async fn fetch_virtual_members(
             r.replication_priority as "replication_priority: ReplicationPriority",
             r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
             r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-            r.age_gate_enabled, r.age_gate_min_age_days,
+            r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
             r.created_at, r.updated_at
         FROM repositories r
         INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
@@ -2982,17 +2982,27 @@ fn shadowing_guard_db_err(virtual_repo_id: Uuid, format: &str, e: sqlx::Error) -
     (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response()
 }
 
-/// PEP 708 dependency-confusion decision for a PyPI virtual repository (#1600).
+/// PEP 708 dependency-confusion decision for a PyPI virtual repository (#1600,
+/// made priority-aware by #2311).
 ///
-/// Returns `true` when the virtual must ISOLATE this project name to its local
-/// owner: a local/staging member owns the PEP 503 normalized `normalized_name`
-/// AND no `pypi_project_tracks` declaration exists on an owning member for it.
-/// When `true`, the caller MUST serve only the owning member's distributions in
-/// both the simple index and the file download (no cross-member union, no
-/// proxy fallthrough), which is PEP 708's "refuse to implicitly assume merging
-/// is safe" default and keeps the index and download consistent.
+/// Returns `Some(min_priority)` when a local/staging member owns the PEP 503
+/// normalized `normalized_name` AND no `pypi_project_tracks` declaration
+/// exists on an owning member for it. `min_priority` is the smallest
+/// `virtual_repo_members.priority` value among the owning local members
+/// (lower value = higher priority, matching the `ORDER BY vrm.priority`
+/// member ordering).
 ///
-/// Returns `false` when the name is not locally owned (proxy normally) or when
+/// The caller must then decide isolation PER REMOTE MEMBER: a Remote member
+/// `R` is suppressed only when the owning local member outranks it
+/// (`min_priority < R.priority`). A Remote member configured at equal or
+/// higher priority than every owning local (`R.priority <= min_priority`)
+/// still surfaces — the operator explicitly ranked the upstream above the
+/// local owner, so hiding it would invert their priority intent (#2311).
+/// Suppression when the local owner outranks the remote is PEP 708's "refuse
+/// to implicitly assume merging is safe" default and must be applied
+/// consistently in both the simple index and the file download.
+///
+/// Returns `None` when the name is not locally owned (proxy normally) or when
 /// an operator `tracks` declaration permits merging the same project across
 /// members (the #1267 union / #1584 version fallthrough then apply).
 ///
@@ -3004,7 +3014,7 @@ pub async fn pypi_virtual_isolates_name(
     db: &PgPool,
     virtual_repo_id: Uuid,
     normalized_name: &str,
-) -> Result<bool, Response> {
+) -> Result<Option<i32>, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let local_ids: Vec<Uuid> = members
         .iter()
@@ -3012,28 +3022,34 @@ pub async fn pypi_virtual_isolates_name(
         .map(|m| m.id)
         .collect();
     if local_ids.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    // Which local/staging members actually own (hold artifacts for) this name?
-    // Uses the same PEP 503 normalization as simple_project so isolation agrees
-    // with what the index lists.
-    let owning_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT repository_id FROM artifacts \
-         WHERE repository_id = ANY($1) \
-           AND is_deleted = false \
-           AND LOWER(REPLACE(REPLACE(REPLACE(name, '_', '-'), '.', '-'), '--', '-')) = $2",
+    // Which local/staging members actually own (hold artifacts for) this name,
+    // and at what member priority? Uses the same PEP 503 normalization as
+    // simple_project so isolation agrees with what the index lists.
+    let owning: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT DISTINCT a.repository_id, vrm.priority \
+         FROM artifacts a \
+         INNER JOIN virtual_repo_members vrm \
+                 ON vrm.member_repo_id = a.repository_id \
+                AND vrm.virtual_repo_id = $3 \
+         WHERE a.repository_id = ANY($1) \
+           AND a.is_deleted = false \
+           AND LOWER(REPLACE(REPLACE(REPLACE(a.name, '_', '-'), '.', '-'), '--', '-')) = $2",
     )
     .bind(&local_ids)
     .bind(normalized_name)
+    .bind(virtual_repo_id)
     .fetch_all(db)
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
-    if owning_ids.is_empty() {
+    if owning.is_empty() {
         // Name is not owned by any local member: no confusion risk, proxy normally.
-        return Ok(false);
+        return Ok(None);
     }
+    let owning_ids: Vec<Uuid> = owning.iter().map(|(id, _)| *id).collect();
 
     // A `tracks` declaration on any owning member means the operator has
     // asserted the local project is the same project as upstream, so merging is
@@ -3048,7 +3064,31 @@ pub async fn pypi_virtual_isolates_name(
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "cross-format", e))?;
 
-    Ok(tracked == 0)
+    if tracked > 0 {
+        return Ok(None);
+    }
+    Ok(owning.iter().map(|(_, priority)| *priority).min())
+}
+
+/// Fetches the `virtual_repo_members.priority` value for every member of
+/// `virtual_repo_id`, keyed by member repository id (lower value = higher
+/// priority). Used by the PyPI virtual paths to make the PEP 708 isolation
+/// decision per remote member relative to the owning local member's priority
+/// (#2311). Fails closed (Err) on DB error, matching
+/// [`pypi_virtual_isolates_name`].
+#[allow(clippy::result_large_err)]
+pub async fn fetch_virtual_member_priorities(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+) -> Result<std::collections::HashMap<Uuid, i32>, Response> {
+    let rows: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT member_repo_id, priority FROM virtual_repo_members WHERE virtual_repo_id = $1",
+    )
+    .bind(virtual_repo_id)
+    .fetch_all(db)
+    .await
+    .map_err(map_db_err)?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Returns true if any non-Remote member of `virtual_repo_id` owns an
@@ -3104,6 +3144,53 @@ pub async fn virtual_non_remote_owns_path(
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "generic", e))?;
 
     Ok(exists.is_some())
+}
+
+/// Resolve the local `artifacts` row a virtual-repo content serve delivered,
+/// so the caller can attribute the download to it (#2394 / #2365).
+///
+/// Only meaningful after [`virtual_non_remote_owns_path`] returned `true`:
+/// the caller then suppresses the proxy, Remote members classify as `Skip`,
+/// and [`resolve_virtual_download`] finalizes in strict member-priority
+/// order — so the winning bytes belong to the FIRST non-Remote member (by
+/// `virtual_repo_members.priority`) holding a non-deleted artifact at the
+/// exact path. This query re-derives that row. Remote pass-through has no
+/// local row and stays unrecorded (#1278).
+///
+/// Best-effort: a database error logs at `warn` and yields `None` —
+/// telemetry must never block or fail the download itself.
+pub async fn virtual_local_winner_artifact_id(
+    db: &PgPool,
+    virtual_repo_id: Uuid,
+    path: &str,
+) -> Option<Uuid> {
+    match sqlx::query_scalar::<_, Uuid>(
+        "SELECT a.id FROM artifacts a \
+         JOIN virtual_repo_members vrm ON vrm.member_repo_id = a.repository_id \
+         JOIN repositories r ON r.id = a.repository_id \
+         WHERE vrm.virtual_repo_id = $1 \
+           AND r.repo_type != 'remote' \
+           AND a.path = $2 \
+           AND a.is_deleted = false \
+         ORDER BY vrm.priority \
+         LIMIT 1",
+    )
+    .bind(virtual_repo_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                %virtual_repo_id,
+                path,
+                error = %e,
+                "failed to resolve virtual download attribution; skipping statistics"
+            );
+            None
+        }
+    }
 }
 
 /// Build the SQL `LIKE` pattern that matches every artifact path under
@@ -3988,6 +4075,7 @@ pub async fn serve_local_artifact(
     storage_key: &str,
     content_type: &str,
     content_disposition_filename: Option<&str>,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let storage = state
         .storage_for_repo(&repo.storage_location())
@@ -4002,12 +4090,7 @@ pub async fn serve_local_artifact(
         .await
         .map_err(|e| internal_error("Storage", e))?;
 
-    let _ = sqlx::query(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-    )
-    .bind(artifact_id)
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact_id, ctx).await;
 
     Ok(build_download_response(
         content,
@@ -4140,6 +4223,7 @@ pub(crate) fn build_remote_repo(id: Uuid, key: &str, upstream_url: &str) -> Repo
         curation_auto_fetch: false,
         age_gate_enabled: false,
         age_gate_min_age_days: 7,
+        versioning_enabled: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -6655,6 +6739,7 @@ mod tests {
                 bind_address: "127.0.0.1:0".into(),
                 log_level: "error".into(),
                 storage_backend: "filesystem".into(),
+                environment: "development".into(),
                 storage_path: storage_path.into(),
                 s3_bucket: None,
                 gcs_bucket: None,
@@ -7240,6 +7325,11 @@ mod tests {
         .await
         .expect("insert");
 
+        let ctx = crate::api::middleware::download_telemetry::DownloadContext {
+            client_ip: Some("203.0.113.77".parse().unwrap()),
+            user_id: Some(user_id),
+            user_agent: Some("serve-local-test/1.0".to_string()),
+        };
         let resp = serve_local_artifact(
             &state,
             &repo,
@@ -7247,6 +7337,7 @@ mod tests {
             "cran/foo/1.0/foo.tar.gz",
             "application/gzip",
             Some("foo.tar.gz"),
+            &ctx,
         )
         .await
         .expect("serve");
@@ -7257,6 +7348,20 @@ mod tests {
         );
         let cd = resp.headers().get("Content-Disposition").unwrap();
         assert!(cd.to_str().unwrap().contains("foo.tar.gz"));
+
+        // #2365: the download must be attributed to the real client, not the
+        // historical '0.0.0.0' sentinel with no user.
+        let (ip, ua, uid): (Option<String>, Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT ip_address, user_agent, user_id FROM download_statistics \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_one(&pool)
+        .await
+        .expect("download_statistics row");
+        assert_eq!(ip.as_deref(), Some("203.0.113.77"));
+        assert_eq!(ua.as_deref(), Some("serve-local-test/1.0"));
+        assert_eq!(uid, Some(user_id));
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
@@ -8719,6 +8824,7 @@ mod tests {
     /// struct literal across each member variant (jscpd).
     fn member_repo(id: Uuid, is_public: bool) -> Repository {
         Repository {
+            versioning_enabled: false,
             id,
             key: format!("member-{}", id.simple()),
             name: "member".to_string(),

@@ -276,27 +276,32 @@ async fn query_release_versions(
 }
 
 /// Fan out a `list_releases` lookup across the members of a virtual repo,
-/// returning the versions from the first member that owns the package
-/// (members are returned in priority order). Remote members are not consulted
-/// for listing because their upstream listing shape is format-specific; the
-/// `.zip`/metadata endpoints proxy them on demand.
+/// aggregating the versions from ALL Local/Staging members that own the
+/// package. Members are visited in priority order and the result is
+/// deduplicated by version string, so when the same version exists in more
+/// than one member the highest-priority member's entry wins. Remote members
+/// are not consulted for listing because their upstream listing shape is
+/// format-specific; the `.zip`/metadata endpoints proxy them on demand.
 pub async fn query_release_versions_virtual(
     db: &PgPool,
     virtual_repo_id: uuid::Uuid,
     package_id: &str,
 ) -> Result<Vec<String>, Response> {
     let members = proxy_helpers::fetch_virtual_members(db, virtual_repo_id).await?;
+    let mut aggregated: Vec<String> = Vec::new();
+    let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
     for member in &members {
         if member.repo_type != RepositoryType::Local && member.repo_type != RepositoryType::Staging
         {
             continue;
         }
-        let versions = query_release_versions(db, member.id, package_id).await?;
-        if !versions.is_empty() {
-            return Ok(versions);
+        for version in query_release_versions(db, member.id, package_id).await? {
+            if seen_versions.insert(version.clone()) {
+                aggregated.push(version);
+            }
         }
     }
-    Ok(Vec::new())
+    Ok(aggregated)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,13 +311,14 @@ pub async fn query_release_versions_virtual(
 async fn version_path_handler(
     State(state): State<SharedState>,
     Path((repo_key, scope, name, version_path)): Path<(String, String, String, String)>,
+    ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let version_path = version_path.trim_start_matches('/');
 
     if version_path.ends_with(".zip") {
         // Download source archive: /:scope/:name/:version.zip
         let version = version_path.trim_end_matches(".zip");
-        return download_archive(state, &repo_key, &scope, &name, version).await;
+        return download_archive(state, &repo_key, &scope, &name, version, &ctx).await;
     }
 
     if version_path.ends_with("/Package.swift") || version_path.contains("/Package.swift") {
@@ -478,6 +484,7 @@ async fn download_archive(
     scope: &str,
     name: &str,
     version: &str,
+    ctx: &crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response, Response> {
     let repo = resolve_swift_repo(&state.db, repo_key).await?;
     let package_id = format!("{}.{}", scope, name);
@@ -586,12 +593,7 @@ async fn download_archive(
         })?;
 
     // Record download
-    let _ = sqlx::query!(
-        "INSERT INTO download_statistics (artifact_id, ip_address) VALUES ($1, '0.0.0.0')",
-        artifact.id
-    )
-    .execute(&state.db)
-    .await;
+    crate::services::artifact_service::record_download(&state.db, artifact.id, ctx).await;
 
     let checksum = artifact.checksum_sha256.clone();
     let filename = format!("{}-{}-{}.zip", scope, name, version);
@@ -1540,6 +1542,7 @@ mod db_cov_tests {
                 "apple",
                 "swift-nio",
                 "2.40.0",
+                &Default::default(),
             )
             .await;
             let response = match result {

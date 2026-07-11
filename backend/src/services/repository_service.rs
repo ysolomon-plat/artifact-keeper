@@ -31,6 +31,9 @@ pub struct CreateRepositoryRequest {
     /// When true, direct user uploads are rejected (artifacts must arrive via
     /// the promotion path). Defaults to false.
     pub promotion_only: bool,
+    /// When true, uploads to Generic/Mlmodel repos append immutable revisions
+    /// to `artifact_versions` instead of overwriting (#2367). Defaults to false.
+    pub versioning_enabled: bool,
     /// Custom format key for WASM plugin handlers (e.g. "rpm-custom").
     pub format_key: Option<String>,
     /// User who is creating this repository. When set, the repository records
@@ -51,6 +54,9 @@ pub struct UpdateRepositoryRequest {
     pub upstream_url: Option<String>,
     /// When `Some`, sets the `promotion_only` flag; `None` leaves it unchanged.
     pub promotion_only: Option<bool>,
+    /// When `Some`, sets the `versioning_enabled` flag (#2367); `None` leaves
+    /// it unchanged.
+    pub versioning_enabled: Option<bool>,
 }
 
 /// Controls which repositories a caller can see in listing results.
@@ -92,20 +98,36 @@ pub(crate) enum VisibilityBind {
 pub(crate) fn validate_remote_upstream(
     repo_type: &RepositoryType,
     upstream_url: &Option<String>,
+    format: &RepositoryFormat,
 ) -> Result<()> {
     if *repo_type == RepositoryType::Remote {
         match upstream_url {
             None => {
                 return Err(AppError::Validation(
                     "Remote repository must have an upstream URL".to_string(),
-                ))
+                ));
             }
-            Some(url) => validate_outbound_url(url, "Upstream URL")?,
+            Some(url) => {
+                validate_outbound_url(url, "Upstream URL")?;
+                if *format == RepositoryFormat::Rpm && is_mirrorlist_or_metalink(url) {
+                    return Err(AppError::Validation(
+                        "RPM remote upstream must be a concrete baseurl, not a mirrorlist/metalink \
+                         URL. Point it at a resolved repo root (e.g. .../BaseOS/x86_64/os/)."
+                            .to_string(),
+                    ));
+                }
+            }
         }
     } else if let Some(url) = upstream_url {
         validate_outbound_url(url, "Upstream URL")?;
     }
     Ok(())
+}
+
+/// Heuristic: a URL whose path or query names a mirrorlist/metalink endpoint.
+fn is_mirrorlist_or_metalink(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("mirrorlist") || lower.contains("metalink")
 }
 
 /// Derive a format key string from a RepositoryFormat enum.
@@ -539,7 +561,7 @@ impl RepositoryService {
     /// Create a new repository
     pub async fn create(&self, req: CreateRepositoryRequest) -> Result<Repository> {
         // Validate remote repository has upstream URL and it is safe to contact
-        validate_remote_upstream(&req.repo_type, &req.upstream_url)?;
+        validate_remote_upstream(&req.repo_type, &req.upstream_url, &req.format)?;
 
         // Check if format handler is enabled (T044).
         //
@@ -596,9 +618,9 @@ impl RepositoryService {
             INSERT INTO repositories (
                 key, name, description, format, repo_type,
                 storage_backend, storage_path, upstream_url,
-                is_public, quota_bytes, promotion_only
+                is_public, quota_bytes, promotion_only, versioning_enabled
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             RETURNING
                 id, key, name, description,
                 format as "format: RepositoryFormat",
@@ -608,7 +630,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             "#,
             req.key,
@@ -622,6 +644,7 @@ impl RepositoryService {
             req.is_public,
             req.quota_bytes,
             req.promotion_only,
+            req.versioning_enabled,
         )
         .fetch_one(&mut *tx)
         .await;
@@ -753,7 +776,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             FROM repositories
             WHERE id = $1
@@ -782,7 +805,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             FROM repositories
             WHERE key = $1
@@ -834,7 +857,7 @@ impl RepositoryService {
                 replication_priority,
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             FROM repositories
             WHERE ($1::repository_format IS NULL OR format = $1)
@@ -893,9 +916,13 @@ impl RepositoryService {
 
     /// Update a repository
     pub async fn update(&self, id: Uuid, req: UpdateRepositoryRequest) -> Result<Repository> {
-        // Validate upstream_url is safe to contact if it is being updated
-        if let Some(ref url) = req.upstream_url {
-            validate_outbound_url(url, "Upstream URL")?;
+        // Validate upstream_url is safe to contact if it is being updated.
+        // `UpdateRepositoryRequest` carries neither `repo_type` nor `format`
+        // (both are immutable after creation), so load the existing row to
+        // source them for the mirrorlist/metalink check on RPM remotes.
+        if req.upstream_url.is_some() {
+            let existing = self.get_by_id(id).await?;
+            validate_remote_upstream(&existing.repo_type, &req.upstream_url, &existing.format)?;
         }
 
         let repo = sqlx::query_as!(
@@ -910,6 +937,7 @@ impl RepositoryService {
                 quota_bytes = COALESCE($6, quota_bytes),
                 upstream_url = COALESCE($7, upstream_url),
                 promotion_only = COALESCE($8, promotion_only),
+                versioning_enabled = COALESCE($9, versioning_enabled),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING
@@ -921,7 +949,7 @@ impl RepositoryService {
                 replication_priority as "replication_priority: ReplicationPriority",
                 curation_enabled, curation_source_repo_id, curation_target_repo_id,
                 curation_default_action, curation_sync_interval_secs, curation_auto_fetch,
-                age_gate_enabled, age_gate_min_age_days,
+                age_gate_enabled, age_gate_min_age_days, versioning_enabled,
                 created_at, updated_at
             "#,
             id,
@@ -932,6 +960,7 @@ impl RepositoryService {
             req.quota_bytes.flatten(),
             req.upstream_url,
             req.promotion_only,
+            req.versioning_enabled,
         )
         .fetch_optional(&self.db)
         .await
@@ -1284,7 +1313,7 @@ impl RepositoryService {
                 r.replication_priority as "replication_priority: ReplicationPriority",
                 r.curation_enabled, r.curation_source_repo_id, r.curation_target_repo_id,
                 r.curation_default_action, r.curation_sync_interval_secs, r.curation_auto_fetch,
-                r.age_gate_enabled, r.age_gate_min_age_days,
+                r.age_gate_enabled, r.age_gate_min_age_days, r.versioning_enabled,
                 r.created_at, r.updated_at
             FROM repositories r
             INNER JOIN virtual_repo_members vrm ON r.id = vrm.member_repo_id
@@ -1430,6 +1459,7 @@ mod tests {
     fn make_test_repo(format: RepositoryFormat, repo_type: RepositoryType) -> Repository {
         let now = chrono::Utc::now();
         Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repository".to_string(),
@@ -1499,6 +1529,7 @@ mod tests {
     fn test_repo_to_search_doc_no_description() {
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "no-desc".to_string(),
             name: "No Description".to_string(),
@@ -1567,6 +1598,7 @@ mod tests {
     #[test]
     fn test_create_repository_request_construction() {
         let req = CreateRepositoryRequest {
+            versioning_enabled: false,
             key: "my-repo".to_string(),
             name: "My Repository".to_string(),
             description: Some("Test repo".to_string()),
@@ -1591,6 +1623,7 @@ mod tests {
     #[test]
     fn test_create_repository_request_remote_with_upstream() {
         let req = CreateRepositoryRequest {
+            versioning_enabled: false,
             key: "npm-remote".to_string(),
             name: "NPM Remote".to_string(),
             description: None,
@@ -1619,6 +1652,7 @@ mod tests {
     #[test]
     fn test_update_repository_request_all_none() {
         let req = UpdateRepositoryRequest {
+            versioning_enabled: None,
             key: None,
             name: None,
             description: None,
@@ -1638,6 +1672,7 @@ mod tests {
     #[test]
     fn test_update_repository_request_partial() {
         let req = UpdateRepositoryRequest {
+            versioning_enabled: None,
             key: None,
             name: Some("Updated Name".to_string()),
             description: Some("Updated Description".to_string()),
@@ -1655,6 +1690,7 @@ mod tests {
     fn test_update_repository_request_clear_quota() {
         // quota_bytes: Some(None) should clear the quota
         let req = UpdateRepositoryRequest {
+            versioning_enabled: None,
             key: None,
             name: None,
             description: None,
@@ -1672,7 +1708,8 @@ mod tests {
 
     #[test]
     fn test_validate_remote_upstream_remote_without_url_fails() {
-        let result = validate_remote_upstream(&RepositoryType::Remote, &None);
+        let result =
+            validate_remote_upstream(&RepositoryType::Remote, &None, &RepositoryFormat::Generic);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("upstream URL"));
     }
@@ -1682,25 +1719,29 @@ mod tests {
         let result = validate_remote_upstream(
             &RepositoryType::Remote,
             &Some("https://upstream.example.com".to_string()),
+            &RepositoryFormat::Generic,
         );
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_remote_upstream_local_without_url_passes() {
-        let result = validate_remote_upstream(&RepositoryType::Local, &None);
+        let result =
+            validate_remote_upstream(&RepositoryType::Local, &None, &RepositoryFormat::Generic);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_remote_upstream_virtual_without_url_passes() {
-        let result = validate_remote_upstream(&RepositoryType::Virtual, &None);
+        let result =
+            validate_remote_upstream(&RepositoryType::Virtual, &None, &RepositoryFormat::Generic);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_remote_upstream_staging_without_url_passes() {
-        let result = validate_remote_upstream(&RepositoryType::Staging, &None);
+        let result =
+            validate_remote_upstream(&RepositoryType::Staging, &None, &RepositoryFormat::Generic);
         assert!(result.is_ok());
     }
 
@@ -1709,6 +1750,7 @@ mod tests {
         let result = validate_remote_upstream(
             &RepositoryType::Remote,
             &Some("http://127.0.0.1:8080/".to_string()),
+            &RepositoryFormat::Generic,
         );
         assert!(result.is_err());
     }
@@ -1718,6 +1760,7 @@ mod tests {
         let result = validate_remote_upstream(
             &RepositoryType::Remote,
             &Some("http://169.254.169.254/latest/meta-data/".to_string()),
+            &RepositoryFormat::Generic,
         );
         assert!(result.is_err());
     }
@@ -1728,8 +1771,26 @@ mod tests {
         let result = validate_remote_upstream(
             &RepositoryType::Local,
             &Some("http://10.0.0.1/internal".to_string()),
+            &RepositoryFormat::Generic,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rpm_remote_rejects_mirrorlist_and_metalink() {
+        let ml = Some("https://mirrors.example.org/mirrorlist?repo=epel-9&arch=x86_64".to_string());
+        let mt = Some("https://mirrors.example.org/metalink?repo=epel-9".to_string());
+        let base = Some("https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/".to_string());
+        assert!(
+            validate_remote_upstream(&RepositoryType::Remote, &ml, &RepositoryFormat::Rpm).is_err()
+        );
+        assert!(
+            validate_remote_upstream(&RepositoryType::Remote, &mt, &RepositoryFormat::Rpm).is_err()
+        );
+        assert!(
+            validate_remote_upstream(&RepositoryType::Remote, &base, &RepositoryFormat::Rpm)
+                .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2706,6 +2767,7 @@ mod tests {
 
         fn make_create_req(suffix: &str, format: RepositoryFormat) -> CreateRepositoryRequest {
             CreateRepositoryRequest {
+                versioning_enabled: false,
                 key: format!("acs-repo-{suffix}"),
                 name: format!("acs repo {suffix}"),
                 description: None,

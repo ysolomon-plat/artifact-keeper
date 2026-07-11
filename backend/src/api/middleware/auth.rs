@@ -747,30 +747,6 @@ async fn validate_api_token_with_scopes(
     })
 }
 
-/// Try to resolve an optional authentication token into an [`AuthExtension`].
-///
-/// Returns `Some(ext)` when a valid Bearer JWT, Bearer API token, or ApiKey
-/// token is present, and `None` otherwise (missing, invalid, or expired).
-/// This is the shared logic used by [`optional_auth_middleware`] and
-/// [`repo_visibility_middleware`].
-///
-/// Note: this helper conflates "no credential" with "invalid credential" —
-/// callers that need to distinguish those two outcomes (e.g. to honour an
-/// off-boarding deactivation immediately on optional-auth routes, see
-/// [`try_resolve_auth_outcome`] and issue #1371) should use the outcome
-/// variant instead.
-pub(crate) async fn try_resolve_auth(
-    auth_service: &AuthService,
-    extracted: ExtractedToken<'_>,
-) -> Option<AuthExtension> {
-    match try_resolve_auth_outcome(auth_service, extracted).await {
-        AuthOutcome::Resolved(ext) => Some(ext),
-        AuthOutcome::NoCredential | AuthOutcome::InvalidCredential | AuthOutcome::Overloaded => {
-            None
-        }
-    }
-}
-
 /// Outcome of resolving an authentication credential.
 ///
 /// Distinguishes three states an optional-auth path needs to handle
@@ -788,9 +764,7 @@ pub(crate) async fn try_resolve_auth(
 ///     instead of being unambiguously rejected, which masks the
 ///     deactivation and weakens the security posture.
 ///
-/// Use [`try_resolve_auth_outcome`] to obtain this tri-state result; the
-/// boolean [`try_resolve_auth`] helper continues to flatten Invalid into
-/// None for callers that don't need to distinguish.
+/// Use [`try_resolve_auth_outcome`] to obtain this tri-state result.
 #[derive(Debug)]
 pub(crate) enum AuthOutcome {
     Resolved(AuthExtension),
@@ -810,11 +784,10 @@ pub(crate) enum AuthOutcome {
 
 /// Resolve a possibly-missing credential into an [`AuthOutcome`].
 ///
-/// This is the strict variant of [`try_resolve_auth`]: it preserves the
-/// distinction between "no credential presented" and "credential presented
-/// but invalid" so optional-auth middleware can return 401 on the latter
-/// rather than silently dropping to anonymous. The original
-/// [`try_resolve_auth`] delegates to this function and flattens the result.
+/// Preserves the distinction between "no credential presented", "credential
+/// presented but invalid", and "transiently overloaded" so callers can return
+/// 401 on invalid, 503 on overload, and continue as anonymous only on the
+/// no-credential case — rather than silently collapsing all three.
 ///
 /// Decision tree:
 ///   * `ExtractedToken::None` -> `NoCredential` (anonymous request)
@@ -1226,6 +1199,25 @@ pub async fn admin_middleware(
     };
 
     if !auth_ext.is_admin {
+        // Best-effort RBAC-deny audit event (#2366): an authenticated non-admin
+        // reaching an admin-only route is exactly the kind of authorization
+        // decision an auditor wants recorded. Fire-and-forget so an audit-table
+        // outage can never turn a clean 403 into a 500. The attempted path is
+        // recorded (never any credential material).
+        {
+            use crate::services::audit_service::{
+                audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+            };
+            let entry = AuditEntry::new(AuditAction::PermissionDenied, ResourceType::User)
+                .user(auth_ext.user_id)
+                .resource(auth_ext.user_id)
+                .details(serde_json::json!({
+                    "path": request.uri().path(),
+                    "method": request.method().as_str(),
+                    "reason": "admin_privileges_required",
+                }));
+            audit_fire_and_forget(auth_service.db().clone(), entry).await;
+        }
         return (StatusCode::FORBIDDEN, "Admin access required").into_response();
     }
 
@@ -1302,7 +1294,10 @@ fn unauthorized_response() -> Response {
 /// `unauthorized_response` is the load-bearing fix for the twine-upload
 /// gate failure: a saturated auth cap is "retry shortly", not "wrong
 /// password".
-fn service_unavailable_response() -> Response {
+///
+/// `pub(super)` so the sibling `guest_access_guard` can return the same 503 for
+/// an `AuthOutcome::Overloaded` shed instead of collapsing it into a 401.
+pub(super) fn service_unavailable_response() -> Response {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .header(axum::http::header::RETRY_AFTER, "1")
@@ -1359,6 +1354,23 @@ pub(crate) fn action_for_method(method: &Method) -> &'static str {
         Method::DELETE => "delete",
         _ => "read",
     }
+}
+
+/// Whether a fine-grained ACL check may be skipped because the repository is
+/// public and the requested action is a read.
+///
+/// On a public repository, anonymous callers are granted read access by the
+/// visibility check (see [`should_allow_repo_access`]) without ever consulting
+/// permission rules. Authenticated callers must therefore receive *at least*
+/// that same read allowance: enforcing the ACL against them when rules exist
+/// would make an authenticated principal strictly less privileged than an
+/// anonymous one on the same public repository (#2329).
+///
+/// This applies only to the `read` action. Write and delete actions are still
+/// fully governed by the ACL when rules exist, and private repositories
+/// (`is_public == false`) never take this shortcut.
+pub(crate) fn public_read_satisfies_acl(is_public: bool, action: &str) -> bool {
+    is_public && action == "read"
 }
 
 /// Middleware that enforces repository visibility on format handler routes.
@@ -1605,23 +1617,34 @@ pub async fn repo_visibility_middleware(
 
             if has_rules {
                 let action = action_for_method(request.method());
-                // Check for the specific action first, then fall back to
-                // "admin" which implies all actions (#827 policy compat).
-                // Both calls resolve from the same cached action set, so the
-                // second call is essentially free.
-                let allowed = vis_state
-                    .permission_service
-                    .check_permission(ext.user_id, "repository", repo.id, action, false)
-                    .await
-                    .unwrap_or(false)
-                    || vis_state
+                // #2329: On a *public* repository, reads are always allowed
+                // for anonymous callers (visibility check above), so an
+                // authenticated caller must not end up with *less* read
+                // access just because ACL rules exist. Grant the anonymous
+                // read baseline and skip the ACL for reads only; writes and
+                // deletes remain fully ACL-gated, and private repos never
+                // take this shortcut. Anonymous callers never reach this
+                // block at all (no `auth_ext`), so the existing
+                // anonymous-public contract is untouched.
+                if !public_read_satisfies_acl(is_public, action) {
+                    // Check for the specific action first, then fall back to
+                    // "admin" which implies all actions (#827 policy compat).
+                    // Both calls resolve from the same cached action set, so
+                    // the second call is essentially free.
+                    let allowed = vis_state
                         .permission_service
-                        .check_permission(ext.user_id, "repository", repo.id, "admin", false)
+                        .check_permission(ext.user_id, "repository", repo.id, action, false)
                         .await
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+                        || vis_state
+                            .permission_service
+                            .check_permission(ext.user_id, "repository", repo.id, "admin", false)
+                            .await
+                            .unwrap_or(false);
 
-                if !allowed {
-                    return forbidden_permission_response();
+                    if !allowed {
+                        return forbidden_permission_response();
+                    }
                 }
             } else if !is_public {
                 // A private repo with NO fine-grained permission rules must
@@ -2879,6 +2902,88 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // public_read_satisfies_acl: public-repo read parity (#2329)
+    //
+    // Regression: with ACL rules present on a *public* repo, an authenticated
+    // non-admin user with no matching grant was denied (403) while anonymous
+    // read of the same path succeeded (200). Authenticated callers must get
+    // at least the anonymous read baseline on public repos.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_public_read_parity_public_repo_read_skips_acl() {
+        // Public repo + read action: ACL check is skipped, so an
+        // authenticated user with no grant is at least as allowed as
+        // anonymous (#2329 core regression).
+        assert!(public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::GET)
+        ));
+        assert!(public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::HEAD)
+        ));
+        assert!(public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::OPTIONS)
+        ));
+    }
+
+    #[test]
+    fn test_public_read_parity_private_repo_still_acl_gated() {
+        // Private repo: no shortcut for any action — the ungranted user must
+        // still hit the ACL (and be denied). No over-allow.
+        assert!(!public_read_satisfies_acl(
+            false,
+            action_for_method(&Method::GET)
+        ));
+        assert!(!public_read_satisfies_acl(false, "read"));
+        assert!(!public_read_satisfies_acl(false, "write"));
+        assert!(!public_read_satisfies_acl(false, "delete"));
+        assert!(!public_read_satisfies_acl(false, "admin"));
+    }
+
+    #[test]
+    fn test_public_read_parity_writes_still_acl_gated_on_public_repo() {
+        // Public repo but non-read actions: writes and deletes remain fully
+        // ACL-gated even on public repos.
+        assert!(!public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::PUT)
+        ));
+        assert!(!public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::POST)
+        ));
+        assert!(!public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::PATCH)
+        ));
+        assert!(!public_read_satisfies_acl(
+            true,
+            action_for_method(&Method::DELETE)
+        ));
+        assert!(!public_read_satisfies_acl(true, "admin"));
+    }
+
+    #[test]
+    fn test_public_read_parity_matches_anonymous_baseline() {
+        // The shortcut must be granted exactly when an anonymous caller
+        // would already pass the visibility check for a read: public repo,
+        // read action. This asserts authenticated read access on public
+        // repos is never narrower than the anonymous baseline.
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            let anonymous_read_allowed =
+                should_allow_repo_access(true, false) && !is_write_method(&method);
+            assert_eq!(
+                public_read_satisfies_acl(true, action_for_method(&method)),
+                anonymous_read_allowed,
+                "authenticated read parity broken for {method}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // forbidden_permission_response (#817)
     // -----------------------------------------------------------------------
 
@@ -3497,7 +3602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_resolve_auth_basic_falls_back_to_jwt_password() {
+    async fn test_try_resolve_auth_outcome_basic_falls_back_to_jwt_password() {
         use crate::api::handlers::test_db_helpers as tdh;
 
         let Some(pool) = tdh::try_pool().await else {
@@ -3518,7 +3623,7 @@ mod tests {
         let jwt = mint_access_jwt(secret, user_id, "ci-user");
         let basic = base64::engine::general_purpose::STANDARD.encode(format!("ci-user:{}", jwt));
 
-        let resolved = try_resolve_auth(&auth_service, ExtractedToken::Basic(&basic)).await;
+        let resolved = try_resolve_auth_outcome(&auth_service, ExtractedToken::Basic(&basic)).await;
 
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user_id)
@@ -3526,10 +3631,14 @@ mod tests {
             .await
             .expect("cleanup test user");
 
-        let ext = resolved.expect("expected jwt fallback to authenticate basic password");
-        assert_eq!(ext.username, "ci-user");
-        assert!(!ext.is_admin);
-        assert!(!ext.is_api_token);
+        match resolved {
+            AuthOutcome::Resolved(ext) => {
+                assert_eq!(ext.username, "ci-user");
+                assert!(!ext.is_admin);
+                assert!(!ext.is_api_token);
+            }
+            other => panic!("expected jwt fallback to authenticate basic password, got {other:?}"),
+        }
     }
 
     async fn run_through_auth_middleware(
@@ -3910,8 +4019,8 @@ mod tests {
     // try_resolve_auth_outcome: tri-state behaviour pinned for #1371.
     // The outcome enum is what lets `optional_auth_middleware` distinguish
     // "no credential" (continue anonymously) from "credential presented but
-    // invalid" (401). The legacy `try_resolve_auth` helper delegates to this
-    // function and collapses Invalid into None for back-compat.
+    // invalid" (401), and `guest_access_guard` distinguish an `Overloaded`
+    // shed (503) from an unauthenticated request (401).
     // -----------------------------------------------------------------------
 
     #[tokio::test]

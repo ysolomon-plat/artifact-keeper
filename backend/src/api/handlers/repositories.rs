@@ -31,6 +31,9 @@ use crate::formats::maven::MavenHandler;
 use crate::models::access_scope::AccessScope;
 use crate::models::repository::{RepositoryFormat, RepositoryType};
 use crate::services::artifact_service::ArtifactService;
+use crate::services::audit_service::{
+    audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
+};
 use crate::services::cache_classifier;
 use crate::services::permission_service::{SYSTEM_SENTINEL_ID, SYSTEM_TARGET_TYPE};
 use crate::services::proxy_service::DEFAULT_CACHE_TTL_SECS;
@@ -118,6 +121,80 @@ pub(crate) async fn require_repo_write_access(
     } else {
         Err(AppError::Authorization(
             "You do not have access to this repository".to_string(),
+        ))
+    }
+}
+
+/// Pure fine-grained per-action decision, mirroring `upload_write_decision`
+/// (#817) in the chunked-upload path. Admins always pass; a repository with no
+/// permission rules falls through to the default access model; otherwise the
+/// caller must hold the requested action or `admin` (which implies all actions).
+///
+/// Factored out so both branches are unit-testable without a database.
+fn repo_fine_grained_action_allowed(
+    is_admin: bool,
+    has_rules: bool,
+    has_action: bool,
+    has_admin: bool,
+) -> bool {
+    if is_admin {
+        return true;
+    }
+    if !has_rules {
+        return true;
+    }
+    has_action || has_admin
+}
+
+/// Fine-grained per-action authorization, applied AFTER `require_repo_write_access`
+/// (the outer tenant gate) on the generic REST artifact write/delete handlers.
+///
+/// `require_repo_write_access` is only a tenant-membership gate: it treats a
+/// public repository or ANY role-assignment grantee (including a read-only one)
+/// as authorized, collapsing read/write/delete into a single "has access"
+/// predicate. That is the gap #2321 (G2) reports: on a rules-bearing repo a
+/// read-only grantee could still PUT/DELETE, and on a public repo any authed
+/// caller could write. This adds the SAME `has_rules -> check_permission(action)`
+/// block the chunked upload-session path (`upload.rs::create_session`, #817)
+/// already enforces, so the action actually maps to the granted permission.
+///
+/// `action` is `"write"` for uploads and `"delete"` for deletes. Admins bypass;
+/// a repository with no permission rules falls through unchanged (the rules-less
+/// public-repo case is a separate global default-access decision, out of scope
+/// here). A permission-rule lookup error fails closed (503), mirroring
+/// `repo_visibility_middleware` and `create_session`.
+async fn require_repo_fine_grained_action(
+    auth: &AuthExtension,
+    repo_id: Uuid,
+    action: &str,
+    permission_service: &crate::services::permission_service::PermissionService,
+) -> Result<()> {
+    if auth.is_admin {
+        return Ok(());
+    }
+    let has_rules = permission_service
+        .has_any_rules_for_target("repository", repo_id)
+        .await
+        .map_err(|_| {
+            tracing::error!("permission check failed: database unreachable");
+            AppError::ServiceUnavailable("permission service temporarily unavailable".to_string())
+        })?;
+    if !has_rules {
+        return Ok(());
+    }
+    let has_action = permission_service
+        .check_permission(auth.user_id, "repository", repo_id, action, false)
+        .await
+        .unwrap_or(false);
+    let has_admin = permission_service
+        .check_permission(auth.user_id, "repository", repo_id, "admin", false)
+        .await
+        .unwrap_or(false);
+    if repo_fine_grained_action_allowed(auth.is_admin, has_rules, has_action, has_admin) {
+        Ok(())
+    } else {
+        Err(AppError::Authorization(
+            "You do not have permission to perform this action on this repository".to_string(),
         ))
     }
 }
@@ -355,6 +432,8 @@ pub fn router() -> Router<SharedState> {
                 .post(upload_artifact_multipart_with_path)
                 .delete(delete_artifact),
         )
+        // Immutable revision history for versioned artifacts (#2367).
+        .route("/:key/versions/*path", get(list_artifact_versions))
         // Note: `/:key/download/*path` lives in `download_router()` so it
         // can carry a stricter per-IP presign-mint rate limit (#1053).
         // Security routes nested under repository
@@ -398,6 +477,10 @@ pub struct CreateRepositoryRequest {
     /// artifacts must arrive via the promotion path. Admin-only to set.
     /// Defaults to false (no behavior change for existing repositories).
     pub promotion_only: Option<bool>,
+    /// Opt this repository into first-class artifact versioning (#2367):
+    /// uploads to Generic/Mlmodel repos append immutable revisions instead
+    /// of overwriting. Defaults to false (current behavior preserved).
+    pub versioning_enabled: Option<bool>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -469,6 +552,9 @@ pub struct UpdateRepositoryRequest {
     /// When provided, enables/disables the `promotion_only` policy for this
     /// repository (admin-only). When omitted, the flag is left unchanged.
     pub promotion_only: Option<bool>,
+    /// When provided, enables/disables first-class artifact versioning for
+    /// this Generic/Mlmodel repository (#2367). When omitted, unchanged.
+    pub versioning_enabled: Option<bool>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -515,6 +601,9 @@ pub struct RepositoryResponse {
     pub allow_anonymous_access: bool,
     /// When true, direct user uploads are rejected; artifacts must be promoted.
     pub promotion_only: bool,
+    /// When true, uploads to this Generic/Mlmodel repository append immutable
+    /// revisions instead of overwriting the prior content (#2367).
+    pub versioning_enabled: bool,
     pub storage_used_bytes: i64,
     pub quota_bytes: Option<i64>,
     pub upstream_url: Option<String>,
@@ -554,6 +643,7 @@ fn repo_to_response(
         allow_anonymous_access: repo.is_public,
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
+        versioning_enabled: repo.versioning_enabled,
         storage_used_bytes,
         quota_bytes: repo.quota_bytes,
         upstream_url: repo.upstream_url,
@@ -896,6 +986,23 @@ pub async fn invalidate_cache(
     let service = RepositoryService::new(state.db.clone());
     let repo = service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &service).await?;
+
+    // #2321 G6: evicting proxy-cache entries is a pull-through supply-chain
+    // control on the same administrative tier as `set_cache_ttl` (an attacker
+    // with plain repo-write could force re-fetches / open a cache-poisoning
+    // window). Require `repository:admin` for non-admins, mirroring
+    // `set_cache_ttl`; the global-admin bypass is preserved.
+    if !auth.is_admin {
+        let has_perm = state
+            .permission_service
+            .check_permission(auth.user_id, "repository", repo.id, "admin", false)
+            .await?;
+        if !has_perm {
+            return Err(AppError::Authorization(
+                "Insufficient permissions to invalidate the cache of this repository".to_string(),
+            ));
+        }
+    }
 
     // Cache invalidation is meaningless on Local / Virtual / Staging repos --
     // only Remote (proxy) repos own a cache. Reject up front before touching
@@ -1412,6 +1519,7 @@ pub async fn create_repository(
             is_public,
             quota_bytes: payload.quota_bytes,
             promotion_only: payload.promotion_only.unwrap_or(false),
+            versioning_enabled: payload.versioning_enabled.unwrap_or(false),
             // Plugin format key takes precedence over any explicit format_key
             // in the payload: when a WASM plugin format was resolved above,
             // `plugin_format_key` carries the canonical handler name.
@@ -1484,6 +1592,20 @@ pub async fn create_repository(
         repo.id,
         Some(auth.username.clone()),
     );
+
+    // Audit trail (#2366): repository created. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RepositoryCreated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "key": repo.key,
+                "is_public": repo.is_public,
+            })),
+    )
+    .await;
 
     let mut response = repo_to_response(repo, 0);
     if let Some(ref at) = payload.upstream_auth_type {
@@ -1613,6 +1735,7 @@ pub async fn update_repository(
                 quota_bytes: payload.quota_bytes.map(Some),
                 upstream_url: None,
                 promotion_only: payload.promotion_only,
+                versioning_enabled: payload.versioning_enabled,
             },
         )
         .await?;
@@ -1710,6 +1833,19 @@ pub async fn update_repository(
         repo.id,
         Some(auth.username.clone()),
     );
+
+    // Audit trail (#2366): repository updated. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RepositoryUpdated, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "key": repo.key,
+            })),
+    )
+    .await;
 
     let repo_id = repo.id;
     let response = repo_to_response(repo, storage_used);
@@ -2024,6 +2160,20 @@ pub async fn delete_repository(
         repo.id,
         Some(auth.username.clone()),
     );
+
+    // Audit trail (#2366): repository deleted. Best-effort.
+    audit_fire_and_forget(
+        state.db.clone(),
+        AuditEntry::new(AuditAction::RepositoryDeleted, ResourceType::Repository)
+            .user(auth.user_id)
+            .resource(repo.id)
+            .details(serde_json::json!({
+                "actor_id": auth.user_id.to_string(),
+                "key": repo.key,
+            })),
+    )
+    .await;
+
     Ok(())
 }
 
@@ -2046,6 +2196,42 @@ pub struct ListArtifactsQuery {
     ///   referenced layer blobs.  The grouped rows are returned in the
     ///   `docker_tags` array.
     pub group_by: Option<String>,
+}
+
+/// `?version=` selector accepted by the artifact metadata/download routes on
+/// versioning-enabled repositories (#2367). A numeric value selects by
+/// server-assigned revision, `latest` (or omitting the parameter) selects the
+/// HEAD, and any other string selects by human `version_label`. Ignored on
+/// repositories without versioning enabled.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct ArtifactVersionQuery {
+    pub version: Option<String>,
+}
+
+/// One immutable stored revision of a versioned artifact (#2367).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ArtifactVersionResponse {
+    /// Server-assigned auto-increment revision (1-based).
+    pub revision: i32,
+    /// Optional human tag supplied via `X-Artifact-Version` at upload time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_label: Option<String>,
+    pub size_bytes: i64,
+    pub checksum_sha256: String,
+    pub content_type: String,
+    /// Id of the user that uploaded this revision (#2397). Always serialized
+    /// (`null` when unknown, e.g. anonymous uploads) so the versions UI can
+    /// rely on the key being present.
+    pub uploaded_by: Option<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Version history for one artifact coordinate, newest first (#2367).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ArtifactVersionListResponse {
+    pub repository_key: String,
+    pub path: String,
+    pub items: Vec<ArtifactVersionResponse>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2086,6 +2272,16 @@ pub struct ArtifactResponse {
     /// re-validated against upstream. Same gating as `cache_cached_at`. (#1541)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Server-assigned revision number for repositories with first-class
+    /// versioning enabled (#2367). `None` for non-versioned repositories and
+    /// for coordinates with no recorded history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<i32>,
+    /// Optional human tag recorded for this revision (from the
+    /// `X-Artifact-Version` upload header). Only populated alongside
+    /// `revision`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_label: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2553,6 +2749,9 @@ fn build_cached_artifact_response(
         // CachedArtifactEntry carries no expiry, so cache_expires_at is None.
         cache_cached_at: Some(entry.cached_at),
         cache_expires_at: None,
+        // Proxy-cache entries carry no versioned history (#2367).
+        revision: None,
+        version_label: None,
     }
 }
 
@@ -2733,6 +2932,10 @@ fn build_artifact_response(
         // get_artifact_metadata populates them after the fact.
         cache_cached_at: None,
         cache_expires_at: None,
+        // Like cache metadata, revision history is populated only by the
+        // per-artifact metadata endpoint, not fanned out in listings (#2367).
+        revision: None,
+        version_label: None,
     }
 }
 
@@ -2783,6 +2986,8 @@ fn expand_maven_secondary_files(
             analyzable: true,
             cache_cached_at: None,
             cache_expires_at: None,
+            revision: None,
+            version_label: None,
         });
     }
     out
@@ -3537,6 +3742,7 @@ fn is_docker_index_content_type(content_type: &str) -> bool {
     params(
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
+        ArtifactVersionQuery,
     ),
     responses(
         (status = 200, description = "Artifact metadata", body = ArtifactResponse),
@@ -3547,6 +3753,8 @@ pub async fn get_artifact_metadata(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    Query(version_query): Query<ArtifactVersionQuery>,
+    dl_ctx: crate::api::middleware::download_telemetry::DownloadContext,
 ) -> Result<Response> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
@@ -3554,6 +3762,33 @@ pub async fn get_artifact_metadata(
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
     let artifact_service = ArtifactService::new(state.db.clone(), storage);
+
+    // #2367: on versioning-enabled Generic/Mlmodel repos, an explicit
+    // `?version=` selector (revision number or human label) resolves against
+    // the immutable revision history instead of the HEAD row. `latest` (or
+    // omitting the parameter) keeps the HEAD path below. The parameter is
+    // ignored on non-versioned repositories so existing clients are
+    // unaffected.
+    let versioning_active = crate::services::artifact_service::versioning_applies(
+        &repo.format,
+        repo.versioning_enabled,
+    );
+    let version_selector = version_query
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "latest");
+    if versioning_active {
+        if let Some(selector) = version_selector {
+            let stored = artifact_service
+                .get_version(repo.id, &path, Some(selector))
+                .await?
+                .ok_or_else(|| {
+                    AppError::NotFound(format!("Artifact version '{selector}' not found"))
+                })?;
+            return Ok(Json(artifact_version_to_response(&key, stored)).into_response());
+        }
+    }
 
     // #1443: npm publish stores tarballs under
     // `<name>/<version>/<name>-<version>.tgz` (see
@@ -3572,6 +3807,17 @@ pub async fn get_artifact_metadata(
     if let Some(artifact) = direct {
         let downloads = artifact_service.get_download_stats(artifact.id).await?;
         let metadata = artifact_service.get_metadata(artifact.id).await?;
+
+        // #2367: surface the HEAD's revision number for versioned repos.
+        let (revision, version_label) = if versioning_active {
+            artifact_service
+                .latest_version_info(repo.id, &artifact.path)
+                .await?
+                .map(|(rev, label)| (Some(rev), label))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
 
         // #1541: surface proxy cache freshness on Remote repos so the UI
         // can render "expires in 4 hours" / "expired" without a separate
@@ -3625,6 +3871,8 @@ pub async fn get_artifact_metadata(
             analyzable: true,
             cache_cached_at: cache_meta.as_ref().map(|m| m.cached_at),
             cache_expires_at: cache_meta.as_ref().map(|m| m.expires_at),
+            revision,
+            version_label,
         })
         .into_response());
     }
@@ -3672,6 +3920,22 @@ pub async fn get_artifact_metadata(
             AppError::NotFound("Artifact not found in any member repository".to_string())
         })?;
 
+        // #2394: unlike the direct-row branch above (metadata JSON only,
+        // intentionally unrecorded), this branch serves the member's BYTES —
+        // a real download — so it must reach the #2365 recorder. When the
+        // shadowing guard proved a non-Remote member owns the exact path, the
+        // served body is that local member's artifact (Remote members were
+        // suppressed); attribute the download to its row. Remote pass-through
+        // resolves no local `artifacts` row and stays unrecorded (#1278).
+        if owns_locally {
+            if let Some(artifact_id) =
+                proxy_helpers::virtual_local_winner_artifact_id(&state.db, repo.id, &path).await
+            {
+                crate::services::artifact_service::record_download(&state.db, artifact_id, &dl_ctx)
+                    .await;
+            }
+        }
+
         let ct = result
             .content_type
             .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -3700,6 +3964,87 @@ pub async fn get_artifact_metadata(
     Err(AppError::NotFound("Artifact not found".to_string()))
 }
 
+/// Build the `ArtifactResponse` describing one stored revision (#2367).
+///
+/// The `id` is the `artifact_versions` row id (not an `artifacts` id), so the
+/// response is marked `analyzable: false` — SBOM/scan lookups key on
+/// `artifacts.id` and cannot resolve a historical revision.
+fn artifact_version_to_response(
+    key: &str,
+    stored: crate::models::artifact::ArtifactVersion,
+) -> ArtifactResponse {
+    ArtifactResponse {
+        id: stored.id,
+        repository_key: key.to_string(),
+        path: stored.path,
+        name: stored.name,
+        version: stored.version_label.clone(),
+        size_bytes: stored.size_bytes,
+        checksum_sha256: stored.checksum_sha256.trim().to_string(),
+        content_type: stored.content_type,
+        download_count: 0,
+        created_at: stored.created_at,
+        metadata: None,
+        analyzable: false,
+        cache_cached_at: None,
+        cache_expires_at: None,
+        revision: Some(stored.revision),
+        version_label: stored.version_label,
+    }
+}
+
+/// List the immutable revision history for a versioned artifact (#2367).
+#[utoipa::path(
+    get,
+    path = "/{key}/versions/{path}",
+    context_path = "/api/v1/repositories",
+    tag = "repositories",
+    params(
+        ("key" = String, Path, description = "Repository key"),
+        ("path" = String, Path, description = "Artifact path"),
+    ),
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "Version history, newest first", body = ArtifactVersionListResponse),
+        (status = 404, description = "Repository or artifact not found"),
+    )
+)]
+pub async fn list_artifact_versions(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<Option<AuthExtension>>,
+    Path((key, path)): Path<(String, String)>,
+) -> Result<Json<ArtifactVersionListResponse>> {
+    let repo_service = RepositoryService::new(state.db.clone());
+    let repo = repo_service.get_by_key(&key).await?;
+    require_visible(&repo, &auth, &repo_service).await?;
+
+    let storage = state.storage_for_repo(&repo.storage_location())?;
+    let artifact_service = ArtifactService::new(state.db.clone(), storage);
+    let versions = artifact_service.list_versions(repo.id, &path).await?;
+    if versions.is_empty() {
+        return Err(AppError::NotFound(
+            "No version history for this artifact".to_string(),
+        ));
+    }
+
+    Ok(Json(ArtifactVersionListResponse {
+        repository_key: key,
+        path,
+        items: versions
+            .into_iter()
+            .map(|v| ArtifactVersionResponse {
+                revision: v.revision,
+                version_label: v.version_label,
+                size_bytes: v.size_bytes,
+                checksum_sha256: v.checksum_sha256.trim().to_string(),
+                content_type: v.content_type,
+                uploaded_by: v.uploaded_by,
+                created_at: v.created_at,
+            })
+            .collect(),
+    }))
+}
+
 /// Upload artifact
 #[utoipa::path(
     put,
@@ -3713,7 +4058,10 @@ pub async fn get_artifact_metadata(
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     security(("bearer_auth" = [])),
     responses(
-        (status = 200, description = "Artifact uploaded", body = ArtifactResponse),
+        // 201, not 200: the handler has always returned StatusCode::CREATED
+        // (package-manager clients depend on it); the spec must say so or
+        // strict generated SDKs treat every successful upload as an error.
+        (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
         (status = 401, description = "Authentication required"),
         (status = 404, description = "Repository not found"),
     )
@@ -3740,6 +4088,11 @@ pub async fn upload_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Fine-grained write gate (#2321 G2): the tenant gate above admits any
+    // grantee (incl. a read-only one) and any authed caller on a public repo,
+    // collapsing read/write. Require the `write` action when rules exist, the
+    // same block `upload.rs::create_session` applies to the chunked path.
+    require_repo_fine_grained_action(&auth, repo.id, "write", &state.permission_service).await?;
 
     // Reject direct uploads to promotion-only repositories. Such repos accept
     // artifacts only via the promotion path (staging -> promotion -> approval);
@@ -3816,6 +4169,25 @@ pub async fn upload_artifact(
         }
     };
 
+    // #2367: on versioning-enabled Generic/Mlmodel repos an explicit
+    // `X-Artifact-Version` header supplies the human version label for the
+    // appended revision, taking precedence over the path-derived guess.
+    // Gated on the opt-in so non-versioned repos keep their exact semantics.
+    let versioning_active = crate::services::artifact_service::versioning_applies(
+        &repo.format,
+        repo.versioning_enabled,
+    );
+    let version = if versioning_active {
+        headers
+            .get("x-artifact-version")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or(version)
+    } else {
+        version
+    };
+
     // Content-Type resolution priority:
     //   1. WASM plugin metadata (format-aware)
     //   2. the request's declared Content-Type header (honour the client)
@@ -3855,6 +4227,17 @@ pub async fn upload_artifact(
     let downloads = artifact_service.get_download_stats(artifact.id).await?;
     let metadata_json = wasm_metadata.map(|m| m.to_json());
 
+    // #2367: echo the revision this upload landed at for versioned repos.
+    let (revision, version_label) = if versioning_active {
+        artifact_service
+            .latest_version_info(repo.id, &artifact.path)
+            .await?
+            .map(|(rev, label)| (Some(rev), label))
+            .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
     Ok((
         StatusCode::CREATED,
         Json(ArtifactResponse {
@@ -3875,6 +4258,8 @@ pub async fn upload_artifact(
             // cache is populated lazily on the first proxy fetch.
             cache_cached_at: None,
             cache_expires_at: None,
+            revision,
+            version_label,
         }),
     ))
 }
@@ -4072,6 +4457,44 @@ fn download_filename(path: &str) -> &str {
         .unwrap_or(path)
 }
 
+/// Best-effort download-statistics recording for the presigned/redirect
+/// download path (S3/CloudFront).
+///
+/// Writes to `download_statistics` — the same table (and column set) the
+/// streaming path's `ArtifactService::finish_download` uses, so redirect
+/// downloads show up in the same analytics as proxied ones. `downloaded_at`
+/// takes the column's `NOW()` default.
+///
+/// Stats recording must never block or fail the download itself, so errors
+/// are logged at `warn` and swallowed rather than propagated.
+async fn record_redirect_download(
+    db: &sqlx::PgPool,
+    artifact_id: Uuid,
+    user_id: Option<Uuid>,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
+) {
+    if let Err(e) = sqlx::query(
+        r#"
+        INSERT INTO download_statistics (artifact_id, user_id, ip_address, user_agent)
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(artifact_id)
+    .bind(user_id)
+    .bind(ip_address)
+    .bind(user_agent)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            %artifact_id,
+            error = %e,
+            "failed to record download statistics for redirect download"
+        );
+    }
+}
+
 /// Outcome of parsing an HTTP `Range` request header against a known total
 /// size. We only support a single `bytes=start-end` range (the common case for
 /// resumable downloads and media seeking); anything more exotic falls back to a
@@ -4261,6 +4684,63 @@ pub(crate) fn ranged_stream_response(
     Ok(response)
 }
 
+/// Serve one immutable stored revision of a versioned artifact (#2367).
+///
+/// Streams the revision's bytes from content-addressed storage. No download
+/// statistics are recorded (stats key on `artifacts.id`, which a historical
+/// revision does not have). Range requests are honored like the HEAD path.
+async fn download_artifact_version(
+    artifact_service: &ArtifactService,
+    repo_id: Uuid,
+    path: &str,
+    selector: &str,
+    range_header: Option<&str>,
+    is_head: bool,
+) -> Result<Response> {
+    let stored = artifact_service
+        .get_version(repo_id, path, Some(selector))
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Artifact version '{selector}' not found")))?;
+
+    let total = stored.size_bytes.max(0) as u64;
+    let checksum = stored.checksum_sha256.trim().to_string();
+    let base_headers = vec![
+        (header::CONTENT_TYPE, stored.content_type.clone()),
+        (
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", download_filename(path)),
+        ),
+        (
+            header::HeaderName::from_static("x-checksum-sha256"),
+            checksum,
+        ),
+        (
+            header::HeaderName::from_static("x-artifact-revision"),
+            stored.revision.to_string(),
+        ),
+        (
+            header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+            "proxy".to_string(),
+        ),
+    ];
+
+    if is_head {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_LENGTH, total.to_string())
+            .header(header::ACCEPT_RANGES, "bytes");
+        for (name, value) in base_headers {
+            builder = builder.header(name, value);
+        }
+        return builder
+            .body(Body::empty())
+            .map_err(|e| AppError::Internal(format!("Failed to build response: {e}")));
+    }
+
+    let body = artifact_service.download_version_stream(&stored).await?;
+    ranged_stream_response(range_header, total, body, base_headers)
+}
+
 /// Download artifact
 #[utoipa::path(
     get,
@@ -4270,6 +4750,7 @@ pub(crate) fn ranged_stream_response(
     params(
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
+        ArtifactVersionQuery,
     ),
     responses(
         (status = 200, description = "Artifact binary content", content_type = "application/octet-stream"),
@@ -4281,6 +4762,8 @@ pub async fn download_artifact(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
     Path((key, path)): Path<(String, String)>,
+    Query(version_query): Query<ArtifactVersionQuery>,
+    dl_ctx: crate::api::middleware::download_telemetry::DownloadContext,
     request: axum::http::Request<axum::body::Body>,
 ) -> Result<impl IntoResponse> {
     // A HEAD request must return identical headers to GET but no body, and it
@@ -4330,21 +4813,48 @@ pub async fn download_artifact(
         }
     }
 
-    // Get client IP for analytics
-    let ip_addr = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .unwrap_or("127.0.0.1")
-        .parse()
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    // #2367: an explicit `?version=` selector on a versioning-enabled
+    // Generic/Mlmodel repo serves the requested immutable revision straight
+    // from content-addressed storage (old revisions stay addressable even
+    // after the HEAD was overwritten or deleted). `latest` / absent falls
+    // through to the normal HEAD path; the parameter is ignored on
+    // non-versioned repositories so existing clients are unaffected. The
+    // quarantine check above still ran against the coordinate's HEAD row, so
+    // a quarantine hold cannot be bypassed via a historical revision.
+    if crate::services::artifact_service::versioning_applies(&repo.format, repo.versioning_enabled)
+    {
+        let selector = version_query
+            .version
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "latest");
+        if let Some(selector) = selector {
+            let storage = state.storage_for_repo(&repo.storage_location())?;
+            let artifact_service = ArtifactService::new(state.db.clone(), storage);
+            let range_header = request
+                .headers()
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            return download_artifact_version(
+                &artifact_service,
+                repo.id,
+                &path,
+                selector,
+                range_header.as_deref(),
+                is_head,
+            )
+            .await;
+        }
+    }
 
-    let user_agent = request
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    // Client attribution for analytics comes from the shared
+    // `DownloadContext` extractor. Trusted-proxy-aware (#2365): the socket
+    // peer is authoritative and X-Forwarded-For is believed only when the
+    // peer is inside RATE_LIMIT_TRUSTED_PROXY_CIDRS (#2023) — the previous
+    // parse here trusted any XFF. `None` (unresolvable) records as NULL.
+    let client_ip_str = dl_ctx.client_ip.map(|ip| ip.to_string());
+    let user_agent = dl_ctx.user_agent.clone();
 
     // Check if the storage backend supports redirect downloads (S3 with presigned URLs).
     // This path is gated on PRESIGNED_DOWNLOADS_ENABLED (or the per-backend
@@ -4377,18 +4887,18 @@ pub async fn download_artifact(
                 .get_presigned_url(&artifact.storage_key, expiry)
                 .await?
             {
-                // Record download analytics
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO download_events (artifact_id, user_id, ip_address, user_agent, downloaded_at)
-                    VALUES ($1, $2, $3, $4, NOW())
-                    "#,
+                // Record download analytics (best-effort; must not block the
+                // redirect). This previously inserted into an events table
+                // that does not exist in the schema — and discarded the
+                // error — so every presigned/redirect download was silently
+                // missing from download statistics (#2260, bug 1).
+                record_redirect_download(
+                    &state.db,
+                    artifact.id,
+                    auth.as_ref().map(|a| a.user_id),
+                    client_ip_str.as_deref(),
+                    user_agent.as_deref(),
                 )
-                .bind(artifact.id)
-                .bind(auth.as_ref().map(|a| a.user_id))
-                .bind(ip_addr.to_string())
-                .bind(user_agent.as_deref())
-                .execute(&state.db)
                 .await;
 
                 tracing::info!(
@@ -4410,7 +4920,7 @@ pub async fn download_artifact(
             repo.id,
             &path,
             auth.map(|a| a.user_id),
-            Some(ip_addr.to_string()),
+            client_ip_str.clone(),
             user_agent.as_deref(),
         )
         .await;
@@ -4522,6 +5032,29 @@ pub async fn download_artifact(
                 AppError::NotFound("Artifact not found in any member repository".to_string())
             })?;
 
+            // #2398 (sibling of #2394): this arm is only reached when
+            // `download_stream` returned NotFound for the virtual repo
+            // itself, so the #2365 recorder inside it never fired — yet the
+            // response streams a member's BYTES, a real download. When the
+            // shadowing guard proved a non-Remote member owns the exact path
+            // (Remote members were suppressed), attribute the download to
+            // that local member's artifact row. Remote pass-through resolves
+            // no local `artifacts` row and stays unrecorded (#1278). No
+            // double-count: the direct-row path records in `download_stream`
+            // and cannot reach this arm.
+            if owns_locally {
+                if let Some(artifact_id) =
+                    proxy_helpers::virtual_local_winner_artifact_id(&state.db, repo.id, &path).await
+                {
+                    crate::services::artifact_service::record_download(
+                        &state.db,
+                        artifact_id,
+                        &dl_ctx,
+                    )
+                    .await;
+                }
+            }
+
             let ct = result
                 .content_type
                 .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -4622,6 +5155,11 @@ pub async fn delete_artifact(
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
+    // Fine-grained delete gate (#2321 G2): the tenant gate above admits any
+    // grantee (incl. a write-only or read-only one), collapsing write/delete.
+    // Require the `delete` action when rules exist so a write-scoped grantee
+    // cannot destroy artifacts. Mirrors the upload path's `write` gate.
+    require_repo_fine_grained_action(&auth, repo.id, "delete", &state.permission_service).await?;
 
     // Resolve the npm canonical `/-/` URL shape the Web UI emits to the
     // version-segmented path the tarball is actually stored under (#2269),
@@ -5502,6 +6040,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         upload_artifact,
         download_artifact,
         delete_artifact,
+        list_artifact_versions,
         list_virtual_members,
         add_virtual_member,
         remove_virtual_member,
@@ -5528,6 +6067,9 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         ListArtifactsQuery,
         ArtifactResponse,
         ArtifactListResponse,
+        ArtifactVersionQuery,
+        ArtifactVersionResponse,
+        ArtifactVersionListResponse,
         MavenComponentResponse,
         DockerTagResponse,
         AddVirtualMemberRequest,
@@ -5645,6 +6187,144 @@ mod tests {
         // A trailing slash would otherwise yield an empty basename; fall back
         // to the full path rather than emitting an empty filename.
         assert_eq!(download_filename("a/b/"), "a/b/");
+    }
+
+    // -----------------------------------------------------------------------
+    // Presigned/redirect download statistics (#2260, bug 1)
+    //
+    // The redirect path used to INSERT into an events table that does not
+    // exist in the schema and discard the error, so every presigned
+    // (S3/CloudFront) download was silently missing from analytics. It must
+    // record into `download_statistics`, the table the streaming path's
+    // `ArtifactService::finish_download` uses.
+    //
+    // The DB-backed tests run only when DATABASE_URL points at a migrated
+    // Postgres (as in CI); they skip cleanly otherwise.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn presigned_download_path_does_not_reference_legacy_events_table() {
+        // Source-level regression guard: the non-existent table name must not
+        // reappear in this handler module. Built with concat! so this test's
+        // own literal does not match itself.
+        let legacy_table = concat!("download_", "events");
+        let src = include_str!("repositories.rs");
+        assert_eq!(
+            src.matches(legacy_table).count(),
+            0,
+            "repositories.rs must not reference the non-existent `{legacy_table}` table; \
+             download recording goes to `download_statistics` (#2260, bug 1)"
+        );
+    }
+
+    async fn test_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    async fn seed_artifact(pool: &sqlx::PgPool) -> Uuid {
+        let key = format!("redirect-stats-test-{}", Uuid::new_v4().as_simple());
+        let repo_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO repositories (key, name, format, repo_type, storage_path) \
+             VALUES ($1, $1, 'generic', 'local', '/tmp/test') RETURNING id",
+        )
+        .bind(&key)
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test repository");
+
+        sqlx::query_scalar(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, '1.0.0', 100, $4, 'application/octet-stream', $5) RETURNING id",
+        )
+        .bind(repo_id)
+        .bind(format!("{key}/artifact.bin"))
+        .bind(&key)
+        .bind(format!("{:0>64}", "ab"))
+        .bind(format!("{key}/storage.bin"))
+        .fetch_one(pool)
+        .await
+        .expect("failed to create test artifact")
+    }
+
+    #[tokio::test]
+    async fn record_redirect_download_writes_download_statistics() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // The table the old code wrote to must not exist — writing there was
+        // pure data loss, never a fallback.
+        let legacy: Option<String> =
+            sqlx::query_scalar(concat!("SELECT to_regclass('download_", "events')::text"))
+                .fetch_one(&pool)
+                .await
+                .expect("to_regclass query failed");
+        assert!(
+            legacy.is_none(),
+            "the legacy table unexpectedly exists; this regression test assumes it does not"
+        );
+
+        let artifact_id = seed_artifact(&pool).await;
+
+        record_redirect_download(
+            &pool,
+            artifact_id,
+            None,
+            Some("203.0.113.7"),
+            Some("redirect-stats-test-agent/1.0"),
+        )
+        .await;
+
+        let row: Option<(Option<String>, Option<String>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT ip_address, user_agent, user_id FROM download_statistics \
+             WHERE artifact_id = $1",
+        )
+        .bind(artifact_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("failed to query download_statistics");
+
+        let (ip, ua, user_id) =
+            row.expect("redirect download was not recorded in download_statistics");
+        assert_eq!(ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(ua.as_deref(), Some("redirect-stats-test-agent/1.0"));
+        assert_eq!(user_id, None);
+
+        // Cleanup (FK cascade removes the download_statistics row).
+        sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            .bind(artifact_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    async fn record_redirect_download_swallows_stats_errors() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+
+        // A non-existent artifact violates the FK; recording must stay
+        // best-effort (log + swallow) so a stats failure never fails the
+        // download. Reaching the assertion at all proves no panic/propagation.
+        let bogus_artifact = Uuid::new_v4();
+        record_redirect_download(&pool, bogus_artifact, None, Some("203.0.113.8"), None).await;
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM download_statistics WHERE artifact_id = $1")
+                .bind(bogus_artifact)
+                .fetch_one(&pool)
+                .await
+                .expect("failed to query download_statistics");
+        assert_eq!(count, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -6788,6 +7468,7 @@ mod tests {
     #[test]
     fn test_repository_response_serialization() {
         let resp = RepositoryResponse {
+            versioning_enabled: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "my-repo".to_string(),
             name: "My Repo".to_string(),
@@ -7405,6 +8086,8 @@ mod tests {
     #[test]
     fn test_artifact_response_serialization() {
         let resp = ArtifactResponse {
+            revision: None,
+            version_label: None,
             id: Uuid::new_v4(),
             repository_key: "my-repo".to_string(),
             path: "org/example/1.0/example-1.0.jar".to_string(),
@@ -7434,6 +8117,44 @@ mod tests {
     }
 
     #[test]
+    fn test_artifact_version_response_serializes_uploaded_by() {
+        // (#2397) The versions API must expose who uploaded each revision so
+        // the version-history UI can show the uploader column.
+        let uploader = Uuid::new_v4();
+        let resp = ArtifactVersionResponse {
+            revision: 2,
+            version_label: Some("v1.0.1".to_string()),
+            size_bytes: 2048,
+            checksum_sha256: "abc123".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            uploaded_by: Some(uploader),
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(&format!("\"uploaded_by\":\"{uploader}\"")));
+        assert!(json.contains("\"version_label\":\"v1.0.1\""));
+        assert!(json.contains("\"revision\":2"));
+    }
+
+    #[test]
+    fn test_artifact_version_response_uploaded_by_null_when_unknown() {
+        // (#2397) Unlike `version_label`, `uploaded_by` is always serialized
+        // -- as `null` when unknown -- so clients can rely on the key.
+        let resp = ArtifactVersionResponse {
+            revision: 1,
+            version_label: None,
+            size_bytes: 1024,
+            checksum_sha256: "def456".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"uploaded_by\":null"));
+        assert!(!json.contains("version_label"));
+    }
+
+    #[test]
     fn test_artifact_response_serialization_with_cache_metadata() {
         // (#1541) When populated -- which only happens for Remote repos
         // whose proxy is configured AND have a cache-metadata blob for
@@ -7448,6 +8169,8 @@ mod tests {
             .with_timezone(&chrono::Utc);
 
         let resp = ArtifactResponse {
+            revision: None,
+            version_label: None,
             id: Uuid::new_v4(),
             repository_key: "pypi-remote".to_string(),
             path: "requests/requests-2.31.0-py3-none-any.whl".to_string(),
@@ -8020,6 +8743,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
             key: "maven-central".to_string(),
             name: "Maven Central".to_string(),
@@ -8069,6 +8793,7 @@ mod tests {
         // #1770 B: when the handler populates the quarantine settings from
         // `repository_config`, they appear in the serialized detail response.
         let resp = RepositoryResponse {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "npm-age".to_string(),
             name: "npm-age".to_string(),
@@ -8099,6 +8824,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "npm-hosted".to_string(),
             name: "NPM Local".to_string(),
@@ -8143,6 +8869,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "docker-all".to_string(),
             name: "Docker Virtual".to_string(),
@@ -8180,6 +8907,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let repo = Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "cargo-staging".to_string(),
             name: "Cargo Staging".to_string(),
@@ -8295,6 +9023,7 @@ mod tests {
         use crate::models::repository::{ReplicationPriority, Repository};
         let now = chrono::Utc::now();
         Repository {
+            versioning_enabled: false,
             id,
             key: key.to_string(),
             name: key.to_string(),
@@ -8424,6 +9153,44 @@ mod tests {
         // Non-admins are allowed only when they hold repository:admin.
         assert!(member_mutation_admin_allowed(false, true));
         assert!(!member_mutation_admin_allowed(false, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // #2321 G2: pure fine-grained per-action decision (write/delete) applied
+    // after the tenant gate on the generic REST + OCI artifact paths. Mirrors
+    // `upload.rs::upload_write_decision`.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_repo_fine_grained_action_admin_always_allowed() {
+        // Admins bypass regardless of rules/actions state.
+        assert!(repo_fine_grained_action_allowed(true, false, false, false));
+        assert!(repo_fine_grained_action_allowed(true, true, false, false));
+    }
+
+    #[test]
+    fn test_repo_fine_grained_action_no_rules_falls_through() {
+        // A repo with no permission rules keeps the default access model.
+        assert!(repo_fine_grained_action_allowed(false, false, false, false));
+    }
+
+    #[test]
+    fn test_repo_fine_grained_action_rules_require_matching_action() {
+        // Rules exist but the caller holds neither the action nor admin -> deny.
+        // This is the read-only-grantee-cannot-write / write-only-cannot-delete
+        // collapse that #2321 G2 closes.
+        assert!(!repo_fine_grained_action_allowed(false, true, false, false));
+    }
+
+    #[test]
+    fn test_repo_fine_grained_action_rules_with_action_allowed() {
+        // Holding the requested action (write or delete) passes.
+        assert!(repo_fine_grained_action_allowed(false, true, true, false));
+    }
+
+    #[test]
+    fn test_repo_fine_grained_action_rules_with_admin_action_allowed() {
+        // `admin` implies all actions, so it passes any per-action gate.
+        assert!(repo_fine_grained_action_allowed(false, true, false, true));
     }
 
     // -----------------------------------------------------------------------
@@ -9028,6 +9795,215 @@ mod tests {
         tdh::cleanup(&pool, repo_id, user_id).await;
     }
 
+    /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
+    /// fine-grained `write` action AFTER the tenant gate. A read-only grantee on
+    /// a rules-bearing private repo is DENIED; adding `write` lets them through;
+    /// an admin bypasses; and a non-member is denied on a PUBLIC repo that
+    /// carries a write rule for someone else (public visibility is read-only).
+    #[tokio::test]
+    async fn upload_artifact_fine_grained_write_gate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await; // tenant membership
+        let auth = tdh::make_auth(user_id, &username);
+        let dirs = dir.to_string_lossy().to_string();
+        // Replace the repo's fine-grained rule set with exactly `actions`, then
+        // return a fresh state so the per-process rules cache never masks the
+        // change (mirrors `set_cache_ttl_requires_repo_admin_grant_db`).
+        let reset_rule = |actions: &'static [&'static str]| {
+            let pool = pool.clone();
+            let dirs = dirs.clone();
+            async move {
+                let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+                    .bind(repo_id)
+                    .execute(&pool)
+                    .await;
+                tdh::grant_repo_actions(&pool, repo_id, user_id, actions).await;
+                tdh::build_state(pool.clone(), &dirs)
+            }
+        };
+
+        // (a) read-only grant on a rules-bearing repo -> write DENIED.
+        let denied = upload_artifact(
+            State(reset_rule(&["read"]).await),
+            Extension(Some(auth.clone())),
+            Path((key.clone(), "pkg/1.0.0/pkg.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "read-only grantee must be denied write, got: {denied:?}"
+        );
+
+        // (d) add the write action -> write ALLOWED.
+        let allowed = upload_artifact(
+            State(reset_rule(&["read", "write"]).await),
+            Extension(Some(auth.clone())),
+            Path((key.clone(), "pkg/1.0.0/pkg.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(allowed.is_ok(), "write grant must upload, got: {allowed:?}");
+
+        // (f) admin bypasses the fine-grained gate even under a restrictive rule.
+        let admin = AuthExtension {
+            is_admin: true,
+            ..tdh::make_auth(user_id, &username)
+        };
+        let admin_ok = upload_artifact(
+            State(reset_rule(&["read"]).await),
+            Extension(Some(admin)),
+            Path((key.clone(), "pkg/2.0.0/pkg.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(admin_ok.is_ok(), "admin must bypass, got: {admin_ok:?}");
+
+        // (c) PUBLIC repo carrying a write rule for ANOTHER user: a non-member
+        // (no grant of their own) passes the tenant gate on visibility but is
+        // still denied write, because public = read-only visibility, not write.
+        let (pub_repo_id, pub_key, pub_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(pub_repo_id)
+            .execute(&pool)
+            .await
+            .expect("make repo public");
+        let (other_id, _other_name) = tdh::create_user(&pool).await;
+        tdh::grant_repo_actions(&pool, pub_repo_id, other_id, &["read", "write"]).await;
+        let nonmember_pub = upload_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                pub_dir.to_string_lossy().as_ref(),
+            )),
+            Extension(Some(tdh::make_auth(user_id, &username))),
+            Path((pub_key.clone(), "pub/1.0.0/pub.bin".to_string())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await;
+        assert!(
+            matches!(nonmember_pub, Err(AppError::Authorization(_))),
+            "non-member must be denied write on a public repo with a write rule, got: {nonmember_pub:?}"
+        );
+
+        tdh::cleanup(&pool, pub_repo_id, other_id).await;
+        let _ = std::fs::remove_dir_all(&pub_dir);
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2321 G2 (delete): the generic REST `delete_artifact` handler enforces the
+    /// fine-grained `delete` action AFTER the tenant gate, so a WRITE-only
+    /// grantee cannot destroy artifacts. Granting `delete` lets them through.
+    #[tokio::test]
+    async fn delete_artifact_fine_grained_delete_gate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "generic").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        let auth = Some(tdh::make_auth(user_id, &username));
+        let path = "pkg/1.0.0/pkg-1.0.0.bin".to_string();
+
+        // Publish an artifact as a write+delete grantee so the row exists.
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        upload_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            )),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+            Bytes::from_static(b"BYTES"),
+        )
+        .await
+        .expect("publish must succeed with write+delete grant");
+
+        // (b) downgrade to write-only (no delete) -> DELETE DENIED.
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write"]).await;
+        let denied = delete_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            )),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::Authorization(_))),
+            "write-only grantee must be denied delete, got: {denied:?}"
+        );
+
+        // (e) restore the delete action -> DELETE ALLOWED.
+        let _ = sqlx::query("DELETE FROM permissions WHERE target_id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let allowed = delete_artifact(
+            State(tdh::build_state(
+                pool.clone(),
+                dir.to_string_lossy().as_ref(),
+            )),
+            Extension(auth.clone()),
+            Path((key.clone(), path.clone())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            allowed.is_ok(),
+            "delete grant must delete, got: {allowed:?}"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2321 G2 binding test: the generic artifact write/delete handlers must
+    /// keep routing through `require_repo_fine_grained_action` after the tenant
+    /// gate. A handler that dropped the call would silently re-collapse
+    /// read/write/delete, so pin it structurally (the DB tests above cannot run
+    /// without a Postgres).
+    #[test]
+    fn test_generic_artifact_handlers_call_fine_grained_gate() {
+        let source = include_str!("repositories.rs");
+        for (handler, action) in [
+            ("upload_artifact", "\"write\""),
+            ("delete_artifact", "\"delete\""),
+        ] {
+            let marker = format!("pub async fn {}(", handler);
+            let start = source
+                .find(&marker)
+                .unwrap_or_else(|| panic!("handler `{}` not found", handler));
+            let rest = &source[start + marker.len()..];
+            let end = rest.find("\npub async fn ").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("require_repo_fine_grained_action(") && body.contains(action),
+                "handler `{}` must call require_repo_fine_grained_action with {} (#2321 G2)",
+                handler,
+                action
+            );
+        }
+    }
+
     /// Issue #913 binding test:
     ///
     /// The unit tests above call the production helper directly, but they
@@ -9202,6 +10178,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         Repository {
+            versioning_enabled: false,
             id: Uuid::new_v4(),
             key: "test-repo".to_string(),
             name: "Test Repo".to_string(),
@@ -9672,6 +10649,10 @@ mod tests {
             return;
         };
 
+        // #2321 G6: invalidate_cache is now repo-admin gated. Grant the fixture
+        // user repository:admin so this success-path test still reaches the
+        // proxy-eviction behavior it covers.
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
         let proxy =
             tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
         let state =
@@ -9728,6 +10709,9 @@ mod tests {
             return;
         };
 
+        // #2321 G6: grant repository:admin so the test reaches the repo_type
+        // (non-remote -> 400) guard rather than being denied 403 at the new gate.
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
         let proxy =
             tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
         let state =
@@ -9769,6 +10753,9 @@ mod tests {
             return;
         };
 
+        // #2321 G6: grant repository:admin so the test reaches the
+        // proxy-service-missing (-> 503) guard rather than the new 403 gate.
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
         // Plain `build_state` does NOT install a proxy_service, so the
         // handler hits the `state.proxy_service.as_ref().ok_or_else(...)`
         // arm.
@@ -9790,6 +10777,50 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "missing proxy_service MUST surface as 503 ServiceUnavailable, \
              not 500 / not unwrap-panic (#1539); got status {} with body: {}",
+            status,
+            String::from_utf8_lossy(&body),
+        );
+    }
+
+    /// #2321 G6 (denial): cache invalidation is a proxy supply-chain control on
+    /// the same tier as `set_cache_ttl`, so a plain repo-WRITE member (developer
+    /// role, no `repository:admin` grant) must be rejected 403 — even on a Remote
+    /// repo with the proxy service configured, and BEFORE the repo_type / proxy
+    /// checks. The `invalidate_cache_handler_returns_200_for_remote_repo` test
+    /// (which grants repository:admin) is the matching legit-success case.
+    #[tokio::test]
+    async fn invalidate_cache_handler_requires_repo_admin() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        // Fixture::setup grants the developer (write) role but NOT
+        // repository:admin, so the caller passes the tenant gate and is denied
+        // by the new repo-admin gate.
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let router = tdh::router_with_auth(super::router(), state, auth);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/{}/cache/invalidate?path=anything", fx.repo_key))
+            .body(Body::empty())
+            .expect("build POST request");
+        let (status, body) = tdh::send(router, req).await;
+
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "repo-write-only caller must be 403 on invalidate_cache (#2321 G6); \
+             got status {} with body: {}",
             status,
             String::from_utf8_lossy(&body),
         );
@@ -10669,12 +11700,12 @@ mod tests {
             assert!(
                 validate_virtual_repo_member_count("my-repo", &rt, None).is_ok(),
                 "{:?} with no members must be Ok",
-                &rt
+                rt
             );
             assert!(
                 validate_virtual_repo_member_count("my-repo", &rt, Some(&[])).is_ok(),
                 "{:?} with empty members must be Ok",
-                &rt
+                rt
             );
         }
     }
@@ -11142,6 +12173,423 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // get_artifact_metadata: download telemetry on the virtual content
+    // branch (#2394, completing #2365).
+    //
+    // GET /:key/artifacts/*path has two shapes: a direct `artifacts` row in
+    // the addressed repo returns metadata JSON (a read, not a download),
+    // while a Virtual repo streams the winning member's BYTES — a real
+    // download that used to bypass the #2365 recorder entirely. Pinned here:
+    //   1. a virtual content serve backed by a local member records ONE
+    //      `download_statistics` row against the member's artifact, with the
+    //      resolved client IP and the user (NULL when anonymous)
+    //   2. a metadata-only read records nothing
+    //   3. a virtual remote pass-through records nothing and still inserts
+    //      no `artifacts` row (#1278)
+    // ---------------------------------------------------------------------
+
+    /// Fetch `(user_id, ip_address, user_agent)` telemetry rows for one
+    /// artifact, oldest first.
+    async fn telemetry_rows(
+        pool: &sqlx::PgPool,
+        artifact_id: Uuid,
+    ) -> Vec<(Option<Uuid>, Option<String>, Option<String>)> {
+        sqlx::query_as(
+            "SELECT user_id, ip_address, user_agent FROM download_statistics \
+             WHERE artifact_id = $1 ORDER BY downloaded_at",
+        )
+        .bind(artifact_id)
+        .fetch_all(pool)
+        .await
+        .expect("query download_statistics")
+    }
+
+    #[tokio::test]
+    async fn test_artifacts_get_virtual_local_serve_records_download() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add virtual member");
+
+        let body_bytes: &[u8] = b"virtual-member-content-bytes";
+        let member_repo = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        let artifact_id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member_repo,
+            &storage_key,
+            "vpath/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(body_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        // Authenticated content GET through the virtual repo. No ConnectInfo
+        // peer exists in a unit router, so DownloadContext falls back to the
+        // parseable X-Forwarded-For value for the client IP.
+        let mut req = tdh::get(format!("/{}/artifacts/vpath/blob.bin", fx.repo_key));
+        req.headers_mut()
+            .insert("x-forwarded-for", "203.0.113.77".parse().unwrap());
+        req.headers_mut()
+            .insert("user-agent", "dl-telemetry-test/1.0".parse().unwrap());
+        let (status, body) = tdh::send(fx.router_with_auth(router()), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            body_bytes,
+            "virtual /artifacts/ GET must serve the member's content bytes"
+        );
+
+        let rows = telemetry_rows(&fx.pool, artifact_id).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a virtual content serve must record exactly one download_statistics row"
+        );
+        assert_eq!(rows[0].0, Some(fx.user_id), "user must be attributed");
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some("203.0.113.77"),
+            "resolved client IP must be recorded, not a sentinel"
+        );
+        assert_eq!(rows[0].2.as_deref(), Some("dl-telemetry-test/1.0"));
+
+        // Anonymous content GET: user_id records as NULL, not dropped.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make virtual repo public");
+        let mut anon_req = tdh::get(format!("/{}/artifacts/vpath/blob.bin", fx.repo_key));
+        anon_req
+            .headers_mut()
+            .insert("x-forwarded-for", "203.0.113.78".parse().unwrap());
+        let (anon_status, _) = tdh::send(fx.router_anon(router()), anon_req).await;
+        assert_eq!(anon_status, axum::http::StatusCode::OK);
+
+        let rows = telemetry_rows(&fx.pool, artifact_id).await;
+        assert_eq!(rows.len(), 2, "anonymous serve must also record");
+        assert_eq!(rows[1].0, None, "anonymous must record a NULL user");
+        assert_eq!(rows[1].1.as_deref(), Some("203.0.113.78"));
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, member_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_artifacts_get_metadata_read_does_not_record() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let repo = fx.repo_info("local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        let artifact_id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &storage_key,
+            "meta/only.bin",
+            "only",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(b"metadata-branch-bytes"),
+            fx.user_id,
+        )
+        .await;
+
+        let mut req = tdh::get(format!("/{}/artifacts/meta/only.bin", fx.repo_key));
+        req.headers_mut()
+            .insert("x-forwarded-for", "203.0.113.79".parse().unwrap());
+        let (status, body) = tdh::send(fx.router_with_auth(router()), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .expect("direct-row branch must return metadata JSON, not content bytes");
+        assert_eq!(v["path"], "meta/only.bin");
+
+        let rows = telemetry_rows(&fx.pool, artifact_id).await;
+        assert!(
+            rows.is_empty(),
+            "a metadata-only read is not a download and must record nothing"
+        );
+
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_artifacts_get_virtual_remote_passthrough_does_not_record() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "remote", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add remote virtual member");
+
+        let server = wiremock::MockServer::start().await;
+        let upstream_body: &[u8] = b"remote-passthrough-bytes";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pass/through.bin"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(upstream_body))
+            .mount(&server)
+            .await;
+        point_repo_at_upstream(&fx.pool, member_id, &server.uri()).await;
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let mut req = tdh::get(format!("/{}/artifacts/pass/through.bin", fx.repo_key));
+        req.headers_mut()
+            .insert("x-forwarded-for", "203.0.113.80".parse().unwrap());
+        let (status, body) = tdh::send(tdh::router_with_auth(router(), state, auth), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], upstream_body);
+
+        // #1278: a proxy pass-through must not materialize an artifacts row,
+        // and therefore records no download_statistics either.
+        let artifact_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = ANY($1)")
+                .bind(vec![fx.repo_id, member_id])
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count artifacts");
+        assert_eq!(
+            artifact_count, 0,
+            "remote pass-through must not insert into artifacts (#1278)"
+        );
+        let stat_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM download_statistics WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = ANY($1))",
+        )
+        .bind(vec![fx.repo_id, member_id])
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count stats");
+        assert_eq!(
+            stat_count, 0,
+            "remote pass-through must record no download_statistics"
+        );
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, member_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // download_artifact: download telemetry on the virtual-member-local
+    // branch (#2398, sibling of #2394).
+    //
+    // GET /:key/download/*path on a Virtual repository falls through to
+    // `resolve_virtual_download` when the virtual repo has no direct row.
+    // When the shadowing guard proves a non-Remote member owns the exact
+    // path, the served bytes are that local member's artifact — a real
+    // download that used to bypass the #2365 recorder (only the direct-row
+    // `download_stream` path recorded). Pinned here:
+    //   1. a virtual-local serve via /download/ records exactly ONE
+    //      `download_statistics` row against the member's artifact, with
+    //      the resolved client IP and the user (NULL when anonymous) — one
+    //      row also proves no double-count vs. the direct-row recorder
+    //   2. a virtual remote pass-through records nothing and still inserts
+    //      no `artifacts` row (#1278)
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_download_virtual_local_serve_records_download() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member_id, member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "local", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add virtual member");
+
+        let body_bytes: &[u8] = b"virtual-member-download-bytes";
+        let member_repo = tdh::make_repo_info(member_id, &member_key, &member_dir, "local", None);
+        let storage_key = format!("ph-test/{}.bin", Uuid::new_v4());
+        let artifact_id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &member_repo,
+            &storage_key,
+            "vdl/blob.bin",
+            "blob",
+            "1.0.0",
+            "application/x-test",
+            Bytes::from_static(body_bytes),
+            fx.user_id,
+        )
+        .await;
+
+        // Authenticated download through the virtual repo. No ConnectInfo
+        // peer exists in a unit router, so DownloadContext falls back to the
+        // parseable X-Forwarded-For value for the client IP.
+        let mut req = tdh::get(format!("/{}/download/vdl/blob.bin", fx.repo_key));
+        req.headers_mut()
+            .insert("x-forwarded-for", "203.0.113.90".parse().unwrap());
+        req.headers_mut()
+            .insert("user-agent", "dl-telemetry-test/2.0".parse().unwrap());
+        let (status, body) = tdh::send(fx.router_with_auth(download_router()), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(
+            &body[..],
+            body_bytes,
+            "virtual /download/ GET must serve the member's content bytes"
+        );
+
+        let rows = telemetry_rows(&fx.pool, artifact_id).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "a virtual-local serve must record exactly one download_statistics row \
+             (zero = #2398 regression, more = double-count)"
+        );
+        assert_eq!(rows[0].0, Some(fx.user_id), "user must be attributed");
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some("203.0.113.90"),
+            "resolved client IP must be recorded, not a sentinel"
+        );
+        assert_eq!(rows[0].2.as_deref(), Some("dl-telemetry-test/2.0"));
+
+        // Anonymous download: user_id records as NULL, not dropped.
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("make virtual repo public");
+        let mut anon_req = tdh::get(format!("/{}/download/vdl/blob.bin", fx.repo_key));
+        anon_req
+            .headers_mut()
+            .insert("x-forwarded-for", "203.0.113.91".parse().unwrap());
+        let (anon_status, _) = tdh::send(fx.router_anon(download_router()), anon_req).await;
+        assert_eq!(anon_status, axum::http::StatusCode::OK);
+
+        let rows = telemetry_rows(&fx.pool, artifact_id).await;
+        assert_eq!(rows.len(), 2, "anonymous serve must also record");
+        assert_eq!(rows[1].0, None, "anonymous must record a NULL user");
+        assert_eq!(rows[1].1.as_deref(), Some("203.0.113.91"));
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, member_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn test_download_virtual_remote_passthrough_does_not_record() {
+        let Some(fx) = tdh::Fixture::setup("virtual", "generic").await else {
+            return;
+        };
+        let (member_id, _member_key, member_dir) =
+            tdh::create_repo(&fx.pool, "remote", "generic").await;
+        sqlx::query(
+            "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+             VALUES ($1, $2, 1)",
+        )
+        .bind(fx.repo_id)
+        .bind(member_id)
+        .execute(&fx.pool)
+        .await
+        .expect("add remote virtual member");
+
+        let server = wiremock::MockServer::start().await;
+        let upstream_body: &[u8] = b"remote-download-passthrough-bytes";
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/pass/dl.bin"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(upstream_body))
+            .mount(&server)
+            .await;
+        point_repo_at_upstream(&fx.pool, member_id, &server.uri()).await;
+
+        let proxy =
+            tdh::build_proxy_service_with_fs(fx.pool.clone(), fx.storage_dir.to_str().unwrap());
+        let state =
+            tdh::build_state_with_proxy(fx.pool.clone(), fx.storage_dir.to_str().unwrap(), proxy);
+        let auth = tdh::make_auth(fx.user_id, &fx.username);
+        let mut req = tdh::get(format!("/{}/download/pass/dl.bin", fx.repo_key));
+        req.headers_mut()
+            .insert("x-forwarded-for", "203.0.113.92".parse().unwrap());
+        let (status, body) =
+            tdh::send(tdh::router_with_auth(download_router(), state, auth), req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(&body[..], upstream_body);
+
+        // #1278: a proxy pass-through must not materialize an artifacts row,
+        // and therefore records no download_statistics either.
+        let artifact_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = ANY($1)")
+                .bind(vec![fx.repo_id, member_id])
+                .fetch_one(&fx.pool)
+                .await
+                .expect("count artifacts");
+        assert_eq!(
+            artifact_count, 0,
+            "remote pass-through must not insert into artifacts (#1278)"
+        );
+        let stat_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM download_statistics WHERE artifact_id IN \
+             (SELECT id FROM artifacts WHERE repository_id = ANY($1))",
+        )
+        .bind(vec![fx.repo_id, member_id])
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count stats");
+        assert_eq!(
+            stat_count, 0,
+            "remote pass-through must record no download_statistics"
+        );
+
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await;
+        tdh::cleanup(&fx.pool, member_id, fx.user_id).await;
+        let _ = std::fs::remove_dir_all(&member_dir);
+        fx.teardown().await;
+    }
+
     // Source-level pin (#1608, epic #1607): the local-serve happy path in
     // `download_artifact` MUST stream via `ArtifactService::download_stream`
     // and `Body::from_stream`, never the buffered `.download(` -> `Bytes`
@@ -11597,7 +13045,7 @@ mod tests {
                      VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 )
                 .bind(repo_id)
-                .bind(format!("app/{}", &key))
+                .bind(format!("app/{}", key))
                 .bind("manifest")
                 .bind(16_i64)
                 .bind("f".repeat(64))
@@ -13008,10 +14456,12 @@ mod tests {
         );
     }
 
-    /// PEP 708 (#1600): a PyPI virtual isolates a locally-owned project name by
-    /// default (so an unrelated public package of the same name is never served
-    /// through the virtual), and only unblocks the cross-member union when an
-    /// operator `tracks` declaration exists on the owning member.
+    /// PEP 708 (#1600, priority-aware per #2311): a PyPI virtual isolates a
+    /// locally-owned project name by default (so an unrelated public package
+    /// of the same name is never served through the virtual), reporting the
+    /// owning local member's priority so callers suppress only the remote
+    /// members the owner outranks, and only unblocks the cross-member union
+    /// when an operator `tracks` declaration exists on the owning member.
     #[tokio::test]
     async fn pypi_virtual_isolates_locally_owned_name_until_tracks_declared() {
         use crate::api::handlers::test_db_helpers as tdh;
@@ -13053,20 +14503,24 @@ mod tests {
         .await
         .expect("seed local artifact");
 
-        // Default: owned locally, no tracks -> ISOLATE (do not merge upstream).
+        // Default: owned locally, no tracks -> ISOLATE (do not merge upstream),
+        // reporting the owning local member's priority (1) so the caller can
+        // suppress exactly the remote members the owner outranks — here the
+        // priority-2 remote (the genuine dependency-confusion case).
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
-                Ok(true)
+                Ok(Some(1))
             ),
-            "a locally-owned name with no tracks declaration must be isolated"
+            "a locally-owned name with no tracks declaration must be isolated \
+             at the owning member's priority"
         );
 
         // A name the local member does not own -> proxy normally (no isolation).
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "six").await,
-                Ok(false)
+                Ok(None)
             ),
             "a name no local member owns must not be isolated"
         );
@@ -13086,7 +14540,7 @@ mod tests {
         assert!(
             matches!(
                 proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "acme-sdk").await,
-                Ok(false)
+                Ok(None)
             ),
             "a tracks declaration must re-enable the cross-member union"
         );
@@ -13098,6 +14552,101 @@ mod tests {
             .ok();
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&virtual_dir);
+    }
+
+    /// #2311: the PEP 708 isolation decision must respect member priority. A
+    /// local member that owns a name but sits at LOWER priority (higher
+    /// `priority` value) than a remote member must not hide that remote: the
+    /// guard reports the owning member's priority and the priority map lets
+    /// callers serve every remote at equal or higher priority, while a remote
+    /// the local owner outranks stays suppressed (the genuine
+    /// dependency-confusion case).
+    #[tokio::test]
+    async fn pypi_virtual_isolation_respects_member_priority() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (local_id, _lk, local_dir) = tdh::create_repo(&pool, "local", "pypi").await;
+        let (remote_hi_id, _rhk, remote_hi_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (remote_lo_id, _rlk, remote_lo_dir) = tdh::create_repo(&pool, "remote", "pypi").await;
+        let (virtual_id, _vk, virtual_dir) = tdh::create_repo(&pool, "virtual", "pypi").await;
+
+        // Priority inversion: the remote at priority 1 outranks the owning
+        // local at priority 2; a second remote at priority 3 is outranked.
+        for (member, priority) in [
+            (remote_hi_id, 1_i32),
+            (local_id, 2_i32),
+            (remote_lo_id, 3_i32),
+        ] {
+            sqlx::query(
+                "INSERT INTO virtual_repo_members (virtual_repo_id, member_repo_id, priority) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(virtual_id)
+            .bind(member)
+            .bind(priority)
+            .execute(&pool)
+            .await
+            .expect("insert virtual member");
+        }
+
+        sqlx::query(
+            "INSERT INTO artifacts \
+             (repository_id, path, name, size_bytes, checksum_sha256, content_type, storage_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(local_id)
+        .bind("mypackage/1.0.0/mypackage-1.0.0-py3-none-any.whl")
+        .bind("mypackage")
+        .bind(1_i64)
+        .bind("0".repeat(64))
+        .bind("application/octet-stream")
+        .bind("pypi/mypackage/1")
+        .execute(&pool)
+        .await
+        .expect("seed local artifact");
+
+        // The guard reports the owning local member's priority (2), NOT a
+        // blanket "suppress all remotes".
+        let owning = proxy_helpers::pypi_virtual_isolates_name(&pool, virtual_id, "mypackage")
+            .await
+            .expect("isolation query");
+        assert_eq!(
+            owning,
+            Some(2),
+            "the guard must report the owning local member's priority"
+        );
+
+        // The per-member decision the handlers apply: a remote is suppressed
+        // only when the owning local strictly outranks it.
+        let priorities = proxy_helpers::fetch_virtual_member_priorities(&pool, virtual_id)
+            .await
+            .expect("fetch member priorities");
+        let local_min = owning.expect("owned");
+        let hi_suppressed = local_min < priorities[&remote_hi_id];
+        let lo_suppressed = local_min < priorities[&remote_lo_id];
+        assert!(
+            !hi_suppressed,
+            "a remote member at HIGHER priority (1) than the owning local (2) \
+             must survive isolation so its versions stay visible to pip (#2311)"
+        );
+        assert!(
+            lo_suppressed,
+            "a remote member at LOWER priority (3) than the owning local (2) \
+             must stay suppressed (dependency-confusion protection)"
+        );
+
+        sqlx::query("DELETE FROM repositories WHERE id = ANY($1)")
+            .bind(vec![local_id, remote_hi_id, remote_lo_id, virtual_id])
+            .execute(&pool)
+            .await
+            .ok();
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_hi_dir);
+        let _ = std::fs::remove_dir_all(&remote_lo_dir);
         let _ = std::fs::remove_dir_all(&virtual_dir);
     }
 
@@ -13206,6 +14755,8 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
+            Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
@@ -13222,6 +14773,8 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), unscoped_stored.clone())),
+            Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
@@ -13239,6 +14792,8 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), "nope/-/nope-9.9.9.tgz".to_string())),
+            Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
@@ -13331,6 +14886,8 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), path.clone())),
+            Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
@@ -13345,6 +14902,8 @@ mod tests {
             State(state.clone()),
             Extension(auth.clone()),
             Path((key.clone(), "tools/does-not-exist.bin".to_string())),
+            Query(ArtifactVersionQuery { version: None }),
+            crate::api::middleware::download_telemetry::DownloadContext::default(),
             get_request(),
         )
         .await;
