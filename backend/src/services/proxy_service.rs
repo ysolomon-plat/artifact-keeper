@@ -1547,10 +1547,18 @@ impl CachePersister {
                         // SHA-256 does not match it. The bytes were already
                         // forwarded to the client — which independently verifies
                         // the digest — but the proxy cache must never be poisoned
-                        // with mismatched content addressed by that digest. Treat
-                        // a mismatch exactly like the truncated/empty reject path:
-                        // delete the object and skip the metadata sidecar so the
-                        // next request refetches upstream (self-heal).
+                        // with mismatched content addressed by that digest. Skip
+                        // the metadata sidecar so the next request refetches
+                        // upstream (self-heal). Deliberately do NOT delete
+                        // cache_key_for_writer here (#3068): put_stream above
+                        // already committed this request's bytes as the current
+                        // version, so exists() is always true by this point and
+                        // can't distinguish "only my bad write is here" from "a
+                        // prior good version is one behind it" -- deleting
+                        // either way risks stacking a marker over real content
+                        // from before this request. The missing sidecar alone
+                        // is what forces the refetch; nothing here depends on
+                        // the object also being gone.
                         if let Some(expected) = template.expected_checksum.as_deref() {
                             if result.checksum_sha256 != expected {
                                 tracing::warn!(
@@ -1559,15 +1567,6 @@ impl CachePersister {
                                      not caching (no metadata sidecar) so the cache entry cannot \
                                      be poisoned"
                                 );
-                                if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                                    tracing::debug!(
-                                        cache_key = %cache_key_for_writer,
-                                        error = %e,
-                                        "best-effort delete of digest-mismatched proxy-cache \
-                                         object failed; the missing metadata sidecar still forces \
-                                         a refetch"
-                                    );
-                                }
                                 return;
                             }
                         }
@@ -1664,10 +1663,19 @@ impl CachePersister {
                         // `Content-Length`) would serve a short, SHA-mismatched
                         // blob and clients hit "unexpected BufError" extracting
                         // the archive. Skip the sidecar (entry treated as a
-                        // miss) and delete the bad object so a later GET
-                        // refetches upstream (self-heal). The buffered sibling
-                        // [`Self::write_buffered`] applies the empty-body guard
-                        // before the content write.
+                        // miss) so a later GET refetches upstream (self-heal).
+                        // The buffered sibling [`Self::write_buffered`] applies
+                        // the empty-body guard before the content write.
+                        //
+                        // Deliberately do NOT delete cache_key_for_writer here
+                        // (#3068): put_stream above already committed this
+                        // request's (bad) bytes as the current version, so an
+                        // exists() check is always true by this point and
+                        // can't tell "only my bad write is here" apart from "a
+                        // prior good version is one behind it" -- either way,
+                        // deleting risks stacking a marker over real content
+                        // that predates this request. The missing sidecar is
+                        // what actually forces the refetch.
                         match rejected {
                             StreamWriteOutcome::RejectTruncated { expected, actual } => {
                                 tracing::warn!(
@@ -1687,14 +1695,6 @@ impl CachePersister {
                                      refetches upstream"
                                 );
                             }
-                        }
-                        if let Err(e) = storage_clone.delete(&cache_key_for_writer).await {
-                            tracing::debug!(
-                                cache_key = %cache_key_for_writer,
-                                error = %e,
-                                "best-effort delete of rejected proxy-cache object failed; \
-                                 the missing metadata sidecar still forces a refetch"
-                            );
                         }
                     }
                 },
@@ -4967,8 +4967,19 @@ impl ProxyService {
     /// re-asks upstream.
     async fn write_negative_cache(&self, cache_key: &str, metadata_key: &str, cache_path: &str) {
         // Drop any stale positive body so a future read can never serve it
-        // alongside the negative marker.
-        let _ = self.storage.delete(cache_key).await;
+        // alongside the negative marker. Probe first (#1611 follow-up):
+        // every negative-cache *renewal* on an already-, or never-, cached
+        // path re-enters this function every TTL window, and on a versioned
+        // backend an unconditional delete() always writes a new
+        // delete-marker version even when there is nothing to delete --
+        // observed stacking to 9+ marker versions on repeatedly-missed
+        // paths (e.g. checksum-file probes for deps that never publish a
+        // .sha1) with zero real content ever written. Gate the delete on a
+        // real object being present so renewals of an existing negative (or
+        // a path that never had content) don't write a redundant marker.
+        if matches!(self.storage.exists(cache_key).await, Ok(true)) {
+            let _ = self.storage.delete(cache_key).await;
+        }
 
         let now = Utc::now();
         let neg_ttl = chrono::Duration::seconds(cache_classifier::NEGATIVE_CACHE_TTL_SECS);
@@ -8418,6 +8429,13 @@ mod tests {
         metadata_writes: tokio::sync::Mutex<Vec<(String, Bytes)>>,
         deletes: tokio::sync::Mutex<Vec<String>>,
         put_stream_fails: bool,
+        // #1611-style guard support: a successful put_stream (even a
+        // zero-byte one) creates a real object at the key, same as a real S3
+        // PutObject. exists() reflects that so the reject-arm delete tests
+        // below exercise the same exists()-before-delete guard as prod,
+        // rather than the guard vacuously short-circuiting on an
+        // always-absent mock.
+        object_written: std::sync::atomic::AtomicBool,
     }
 
     impl TeeRecordingBackend {
@@ -8427,6 +8445,7 @@ mod tests {
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: false,
+                object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
         fn failing() -> Arc<Self> {
@@ -8435,6 +8454,7 @@ mod tests {
                 metadata_writes: tokio::sync::Mutex::new(Vec::new()),
                 deletes: tokio::sync::Mutex::new(Vec::new()),
                 put_stream_fails: true,
+                object_written: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -8454,7 +8474,9 @@ mod tests {
             Err(AppError::NotFound("not relevant for tee tests".into()))
         }
         async fn exists(&self, _key: &str) -> Result<bool> {
-            Ok(false)
+            Ok(self
+                .object_written
+                .load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn delete(&self, key: &str) -> Result<()> {
             self.deletes.lock().await.push(key.to_string());
@@ -8488,6 +8510,8 @@ mod tests {
                 total += chunk.len() as u64;
                 chunks.push(chunk);
             }
+            self.object_written
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(ServicePutStreamResult {
                 checksum_sha256: format!("{:x}", hasher.finalize()),
                 bytes_written: total,
@@ -8634,12 +8658,18 @@ mod tests {
     /// #1365 regression: an empty upstream body (a 204, an empty 200, or a
     /// HEAD-style probe that reaches the streaming download path) must NOT
     /// be cached. The client still receives the empty body for this
-    /// request, but the writer must (a) skip the metadata sidecar so a
-    /// later GET is a cache miss, and (b) delete the zero-byte object it
-    /// wrote so the next request refetches the real body from upstream.
+    /// request, but the writer must skip the metadata sidecar so a later
+    /// GET is a cache miss and refetches the real body from upstream.
     /// Before the fix the writer persisted a `size_bytes: 0` sidecar,
     /// which a subsequent GET served as `Content-Length: 0`, breaking
     /// Gradle POM parsing ("Content is not allowed in prolog.").
+    ///
+    /// #3068: the writer must NOT delete cache_key_for_writer either -- by
+    /// this point put_stream already committed the zero-byte write as the
+    /// key's current version, so a delete can't tell "only this bad write is
+    /// here" apart from "a prior good version sits one behind it," and would
+    /// risk stacking a marker over real content. The missing sidecar alone
+    /// is what forces the refetch.
     #[tokio::test]
     async fn test_tee_empty_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8666,10 +8696,11 @@ mod tests {
             "zero-byte upstream body MUST NOT write a metadata sidecar; \
              otherwise the next GET serves a Content-Length: 0 cache hit (#1365)"
         );
-        assert_eq!(
-            backend.deletes.lock().await.as_slice(),
-            ["cache-key".to_string()],
-            "the empty cache object must be deleted so the next request refetches"
+        assert!(
+            backend.deletes.lock().await.is_empty(),
+            "the writer must NOT delete on reject (#3068): put_stream already \
+             committed this write as the current version, so a delete here \
+             could mask real content from before this request"
         );
     }
 
@@ -8716,8 +8747,13 @@ mod tests {
     /// #1912 regression: a truncated upstream body (bytes written < the
     /// advertised `Content-Length`) must NOT be cached. Committing it would
     /// serve a short, SHA-mismatched archive on the next GET and clients hit
-    /// "unexpected BufError" extracting it. The writer must skip the metadata
-    /// sidecar and delete the partial object so the next request refetches.
+    /// "unexpected BufError" extracting it. The writer must skip the
+    /// metadata sidecar so the next request refetches.
+    ///
+    /// #3068: same reasoning as the empty-body sibling above -- the writer
+    /// must NOT delete the partial object either, since put_stream already
+    /// committed it as the current version and a delete can't distinguish
+    /// it from a prior good version one behind it.
     #[tokio::test]
     async fn test_tee_truncated_upstream_is_not_cached() {
         let backend = TeeRecordingBackend::ok();
@@ -8747,10 +8783,48 @@ mod tests {
             backend.metadata_writes.lock().await.is_empty(),
             "truncated upstream body MUST NOT write a metadata sidecar (#1912)"
         );
+        assert!(
+            backend.deletes.lock().await.is_empty(),
+            "the writer must NOT delete on reject (#3068): put_stream already \
+             committed this write as the current version, so a delete here \
+             could mask real content from before this request"
+        );
+    }
+
+    /// #1611 regression: `write_negative_cache`'s `exists()`-gated delete must
+    /// not fire when nothing real is present, on the FIRST negative-cache
+    /// write for a path AND on every renewal after it. Before the guard, an
+    /// unconditional delete() on a versioned backend stacked a redundant
+    /// marker version on every renewal (observed up to 9+ on a single key)
+    /// even though no real content was ever written there.
+    #[tokio::test]
+    async fn test_write_negative_cache_skips_delete_when_nothing_present() {
+        let backend = TeeRecordingBackend::ok();
+        let storage = Arc::new(RealStorageService::new(backend.clone()));
+        let proxy = ProxyService::new(test_catalog_pool(), storage);
+
+        // Two consecutive negative-cache writes, simulating the initial
+        // write plus one TTL renewal against a path that never had real
+        // content -- exactly the "checksum-file probe for a dep that never
+        // publishes a .sha1" case from the #1611 investigation.
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+        proxy
+            .write_negative_cache("cache-key", "meta-key", "some/path")
+            .await;
+
+        assert!(
+            backend.deletes.lock().await.is_empty(),
+            "write_negative_cache must not delete when exists() reports \
+             nothing present (#1611); doing so on every renewal stacks a \
+             redundant marker version with zero real content behind it"
+        );
         assert_eq!(
-            backend.deletes.lock().await.as_slice(),
-            ["cache-key".to_string()],
-            "the truncated cache object must be deleted so the next request refetches"
+            backend.metadata_writes.lock().await.len(),
+            2,
+            "each negative-cache renewal still writes its metadata sidecar \
+             regardless of the delete guard"
         );
     }
 
